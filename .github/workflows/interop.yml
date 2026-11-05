@@ -160,7 +160,7 @@ jobs:
             sed -i "s|clone --depth 1 https://github.com/curl/|clone --depth 1 -b $CURL_BRANCH https://github.com/curl/|" "$dir/Dockerfile"
             grep -qF -- "-b $CURL_BRANCH " "$dir/Dockerfile"
         fi
-        docker build -t ${{ matrix.client }} --build-arg OPENSSL_BRANCH="$COMMIT" "$dir"
+        docker build -t "${{ matrix.client }}" --build-arg OPENSSL_BRANCH="$COMMIT" "$dir"
 
     - name: Pull ngtcp2
       if: ${{ matrix.client == 'ngtcp2' }}
@@ -189,6 +189,14 @@ jobs:
             echo "::warning title=$LABEL::failed: $failed"
             echo "failed=true" >> "$GITHUB_OUTPUT"
         fi
+
+    - name: Remove successful logs
+      if: ${{ steps.run.outputs.failed == 'true' }}
+      run: |
+        jq -r '(.results[][], .measurements[][]) | select(.result == "succeeded") | .name' result.json |
+        while IFS= read -r name; do
+            rm -rfv -- "logs/nginx_${{ matrix.client }}/$name"
+        done
 
     - name: Upload result
       if: ${{ always() }}
