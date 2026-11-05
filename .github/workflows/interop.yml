@@ -39,14 +39,18 @@ jobs:
 
     - name: Resolve ngtcp2 and nginx images
       id: images
+      env:
+        GH_TOKEN: ${{ github.token }}
       run: |
         resolve_image() {
             name=$1 repo=$2 package=$3
             org=${repo%%/*}
             image=ghcr.io/$org/$package
             digest=$(docker buildx imagetools inspect "$image:latest" --format '{{.Manifest.Digest}}')
+            id=$(gh api "/orgs/$org/packages/container/$package/versions" \
+                --jq ".[] | select(.name == \"$digest\") | .id") || true
             echo "${name}_image=$image@$digest" >> "$GITHUB_OUTPUT"
-            echo "${name}_url=https://github.com/$repo/pkgs/container/$package/versions" >> "$GITHUB_OUTPUT"
+            echo "${name}_url=https://github.com/$repo/pkgs/container/$package/${id:-versions}" >> "$GITHUB_OUTPUT"
         }
         resolve_image ngtcp2 ngtcp2/ngtcp2 ngtcp2-interop
         resolve_image nginx brevent/nginx-quic-qns nginx-quic-qns
