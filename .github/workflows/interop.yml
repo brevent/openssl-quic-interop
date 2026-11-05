@@ -1,0 +1,301 @@
+name: OpenSSL QUIC interop
+
+on:
+  push:
+    branches: [ "main" ]
+  schedule:
+    - cron: "20 3 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  resolve:
+    runs-on: ubuntu-26.04
+    permissions:
+      packages: read
+    outputs:
+      openssl_lts: ${{ steps.openssl.outputs.openssl_lts }}
+      openssl_lts_branch: ${{ steps.openssl.outputs.openssl_lts_branch }}
+      openssl_master: ${{ steps.openssl.outputs.openssl_master }}
+      ngtcp2_image: ${{ steps.images.outputs.ngtcp2_image }}
+      ngtcp2_url: ${{ steps.images.outputs.ngtcp2_url }}
+      nginx_image: ${{ steps.images.outputs.nginx_image }}
+      nginx_url: ${{ steps.images.outputs.nginx_url }}
+
+    steps:
+    - name: Resolve openssl commits
+      id: openssl
+      run: |
+        resolve_commit() {
+            commit=$(git ls-remote https://github.com/openssl/openssl.git "refs/heads/$2" | cut -f1)
+            [ -n "$commit" ] || exit 1
+            echo "$1=$commit" >> "$GITHUB_OUTPUT"
+        }
+        lts=openssl-3.5
+        echo "openssl_lts_branch=$lts" >> "$GITHUB_OUTPUT"
+        resolve_commit openssl_lts "$lts"
+        resolve_commit openssl_master master
+
+    - name: Resolve ngtcp2 and nginx images
+      id: images
+      run: |
+        resolve_image() {
+            name=$1 repo=$2 package=$3
+            org=${repo%%/*}
+            image=ghcr.io/$org/$package
+            digest=$(docker buildx imagetools inspect "$image:latest" --format '{{.Manifest.Digest}}')
+            echo "${name}_image=$image@$digest" >> "$GITHUB_OUTPUT"
+            echo "${name}_url=https://github.com/$repo/pkgs/container/$package/versions" >> "$GITHUB_OUTPUT"
+        }
+        resolve_image ngtcp2 ngtcp2/ngtcp2 ngtcp2-interop
+        resolve_image nginx brevent/nginx-quic-qns nginx-quic-qns
+
+  openssl:
+    needs: resolve
+    name: client (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: lts
+            label: ${{ needs.resolve.outputs.openssl_lts_branch }}
+            commit: ${{ needs.resolve.outputs.openssl_lts }}
+            curl_branch: curl-8_18_0
+          - version: master
+            label: openssl-master
+            commit: ${{ needs.resolve.outputs.openssl_master }}
+    runs-on: ubuntu-26.04
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        repository: openssl/openssl
+        ref: ${{ matrix.commit }}
+        path: openssl-src
+        sparse-checkout: test/quic-openssl-docker
+        persist-credentials: false
+
+    - name: Build ${{ matrix.label }}
+      env:
+        COMMIT: ${{ matrix.commit }}
+        CURL_BRANCH: ${{ matrix.curl_branch }}
+      run: |
+        dir=openssl-src/test/quic-openssl-docker
+        old='git clone --depth 1 -b \$OPENSSL_BRANCH \$OPENSSL_URL'
+        new='git init openssl \&\& git -C openssl fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH \&\& git -C openssl checkout FETCH_HEAD'
+        sed -i "s|$old|$new|" "$dir/Dockerfile"
+        grep -qF -- 'fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH' "$dir/Dockerfile"
+        if [ -n "$CURL_BRANCH" ]; then
+            sed -i "s|clone --depth 1 https://github.com/curl/|clone --depth 1 -b $CURL_BRANCH https://github.com/curl/|" "$dir/Dockerfile"
+            grep -qF -- "-b $CURL_BRANCH " "$dir/Dockerfile"
+        fi
+        docker build -t openssl-${{ matrix.version }} --build-arg OPENSSL_BRANCH="$COMMIT" "$dir"
+        docker save openssl-${{ matrix.version }} | gzip > ${{ matrix.label }}.tar.gz
+
+    - uses: actions/upload-artifact@v7
+      with:
+        name: image-${{ matrix.label }}
+        path: ${{ matrix.label }}.tar.gz
+        retention-days: 1
+
+  interop:
+    needs: [ resolve, openssl ]
+    name: interop (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - client: openssl-lts
+            label: ${{ needs.resolve.outputs.openssl_lts_branch }}
+          - client: openssl-master
+            label: openssl-master
+          - client: ngtcp2
+            label: ngtcp2
+    runs-on: ubuntu-26.04
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        repository: quic-interop/quic-interop-runner
+        fetch-depth: 0
+        persist-credentials: false
+
+    - uses: actions/checkout@v7
+      with:
+        repository: openssl/openssl
+        path: .openssl
+        sparse-checkout: .github/retry
+        sparse-checkout-cone-mode: false
+        persist-credentials: false
+
+    - uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+
+    - name: Install python requirements
+      run: .openssl/.github/retry timeout 300 pip install -r requirements.txt
+
+    - name: Update apt repos
+      timeout-minutes: 5
+      run: |
+        sudo apt-get \
+          -o Acquire::Retries=5 \
+          -o Acquire::http::Timeout=15 \
+          -o Acquire::https::Timeout=15 \
+          update
+
+    - name: Install tshark
+      timeout-minutes: 5
+      run: |
+        sudo apt-get \
+          -o Acquire::Retries=5 \
+          -o Acquire::http::Timeout=15 \
+          -o Acquire::https::Timeout=15 \
+          install -y --no-install-recommends tshark
+
+    - name: Patch implementations file
+      run: |
+        jq '. + {
+              "openssl-lts": {image: "openssl-lts", url: "https://github.com/openssl/openssl", role: "client"},
+              "openssl-master": {image: "openssl-master", url: "https://github.com/openssl/openssl", role: "client"}
+            }' implementations_quic.json > implementations.tmp
+        mv implementations.tmp implementations_quic.json
+
+    - name: Set up docker
+      uses: docker/setup-docker-action@v5
+      with:
+        version: "28.1.1"
+
+    - name: Set up docker compose
+      uses: docker/setup-compose-action@v2
+      with:
+        version: "v2.36.2"
+
+    - name: Check docker version
+      run: |
+        docker version
+        docker compose version
+
+    - uses: actions/download-artifact@v7
+      if: ${{ startsWith(matrix.client, 'openssl-') }}
+      with:
+        name: image-${{ matrix.label }}
+
+    - name: Load client image
+      if: ${{ startsWith(matrix.client, 'openssl-') }}
+      run: docker load < ${{ matrix.label }}.tar.gz
+
+    - name: Pull ngtcp2
+      if: ${{ matrix.client == 'ngtcp2' }}
+      env:
+        NGTCP2_IMAGE: ${{ needs.resolve.outputs.ngtcp2_image }}
+      run: |
+        docker pull "$NGTCP2_IMAGE"
+        docker tag "$NGTCP2_IMAGE" ngtcp2-interop
+
+    - name: Pull nginx
+      env:
+        NGINX_IMAGE: ${{ needs.resolve.outputs.nginx_image }}
+      run: |
+        docker pull "$NGINX_IMAGE"
+        docker tag "$NGINX_IMAGE" nginx-interop
+
+    - name: Run all tests
+      id: run
+      env:
+        LABEL: ${{ matrix.label }}
+      run: |
+        python3 run.py -c ${{ matrix.client }} -s nginx -r nginx=nginx-interop,ngtcp2=ngtcp2-interop -d --log-dir logs -j result.json || true
+        jq -e '[.. | objects | select(has("result"))] | length > 0' result.json > /dev/null
+        failed=$(jq -r '[.. | objects | select(has("result")) | select(.result != "succeeded" and .result != "unsupported") | "\(.abbr) \(.name)"] | join(", ")' result.json)
+        if [ -n "$failed" ]; then
+            echo "::warning title=$LABEL::failed: $failed"
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Upload result
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: result-${{ matrix.label }}
+        path: result.json
+        retention-days: 7
+
+    - name: Upload logs
+      if: ${{ failure() || steps.run.outputs.failed == 'true' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: logs-${{ matrix.label }}
+        path: logs
+        retention-days: 7
+
+  summary:
+    needs: [ resolve, interop ]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-results
+      queue: max
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - uses: actions/download-artifact@v7
+      with:
+        pattern: result-*
+
+    - name: Summary
+      env:
+        OPENSSL_LTS: ${{ needs.resolve.outputs.openssl_lts }}
+        OPENSSL_LTS_BRANCH: ${{ needs.resolve.outputs.openssl_lts_branch }}
+        OPENSSL_MASTER: ${{ needs.resolve.outputs.openssl_master }}
+        NGTCP2_IMAGE: ${{ needs.resolve.outputs.ngtcp2_image }}
+        NGTCP2_URL: ${{ needs.resolve.outputs.ngtcp2_url }}
+        NGINX_IMAGE: ${{ needs.resolve.outputs.nginx_image }}
+        NGINX_URL: ${{ needs.resolve.outputs.nginx_url }}
+      run: |
+        lts=${OPENSSL_LTS_BRANCH:-openssl-lts}
+        python3 .github/summary.py \
+            "$lts"="result-$lts/result.json" \
+            openssl-master=result-openssl-master/result.json \
+            ngtcp2=result-ngtcp2/result.json > summary.md
+        cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Publish results
+      if: ${{ github.ref == 'refs/heads/main' }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TZ: Asia/Shanghai
+      run: |
+        url=https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git
+        status=0
+        git ls-remote --exit-code --heads "$url" results > /dev/null || status=$?
+        case $status in
+        0) git clone -q --depth 1 --branch results "$url" results ;;
+        2) git init -q -b results results ;;
+        *) exit "$status" ;;
+        esac
+        cd results
+        week_ago=$(date -d '7 days ago' +%Y-%m-%d)
+        for f in 20*.md; do
+            if [ -e "$f" ] && [[ ${f:0:10} < $week_ago ]]; then
+                rm "$f"
+            fi
+        done
+        cp ../summary.md "$(date +%Y-%m-%d)-$GITHUB_RUN_NUMBER.md"
+        {
+            echo "# OpenSSL QUIC interop results"
+            echo
+            ls 20*.md | sort -rV | sed 's|\(.*\)\.md$|- [\1](\1.md)|'
+        } > README.md
+        git checkout -q --orphan publish
+        git add -A
+        git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -q -m "results of run $GITHUB_RUN_NUMBER"
+        git push -q -f "$url" publish:results
