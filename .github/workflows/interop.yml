@@ -51,56 +51,8 @@ jobs:
         resolve_image ngtcp2 ngtcp2/ngtcp2 ngtcp2-interop
         resolve_image nginx brevent/nginx-quic-qns nginx-quic-qns
 
-  openssl:
-    needs: resolve
-    name: client (${{ matrix.label }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - version: lts
-            label: ${{ needs.resolve.outputs.openssl_lts_branch }}
-            commit: ${{ needs.resolve.outputs.openssl_lts }}
-            curl_branch: curl-8_18_0
-          - version: master
-            label: openssl-master
-            commit: ${{ needs.resolve.outputs.openssl_master }}
-    runs-on: ubuntu-26.04
-
-    steps:
-    - uses: actions/checkout@v7
-      with:
-        repository: openssl/openssl
-        ref: ${{ matrix.commit }}
-        path: openssl-src
-        sparse-checkout: test/quic-openssl-docker
-        persist-credentials: false
-
-    - name: Build ${{ matrix.label }}
-      env:
-        COMMIT: ${{ matrix.commit }}
-        CURL_BRANCH: ${{ matrix.curl_branch }}
-      run: |
-        dir=openssl-src/test/quic-openssl-docker
-        old='git clone --depth 1 -b \$OPENSSL_BRANCH \$OPENSSL_URL'
-        new='git init openssl \&\& git -C openssl fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH \&\& git -C openssl checkout FETCH_HEAD'
-        sed -i "s|$old|$new|" "$dir/Dockerfile"
-        grep -qF -- 'fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH' "$dir/Dockerfile"
-        if [ -n "$CURL_BRANCH" ]; then
-            sed -i "s|clone --depth 1 https://github.com/curl/|clone --depth 1 -b $CURL_BRANCH https://github.com/curl/|" "$dir/Dockerfile"
-            grep -qF -- "-b $CURL_BRANCH " "$dir/Dockerfile"
-        fi
-        docker build -t openssl-${{ matrix.version }} --build-arg OPENSSL_BRANCH="$COMMIT" "$dir"
-        docker save openssl-${{ matrix.version }} | gzip > ${{ matrix.label }}.tar.gz
-
-    - uses: actions/upload-artifact@v7
-      with:
-        name: image-${{ matrix.label }}
-        path: ${{ matrix.label }}.tar.gz
-        retention-days: 1
-
   interop:
-    needs: [ resolve, openssl ]
+    needs: resolve
     name: interop (${{ matrix.label }})
     strategy:
       fail-fast: false
@@ -108,8 +60,11 @@ jobs:
         include:
           - client: openssl-lts
             label: ${{ needs.resolve.outputs.openssl_lts_branch }}
+            commit: ${{ needs.resolve.outputs.openssl_lts }}
+            curl_branch: curl-8_18_0
           - client: openssl-master
             label: openssl-master
+            commit: ${{ needs.resolve.outputs.openssl_master }}
           - client: ngtcp2
             label: ngtcp2
     runs-on: ubuntu-26.04
@@ -119,6 +74,15 @@ jobs:
       with:
         repository: quic-interop/quic-interop-runner
         fetch-depth: 0
+        persist-credentials: false
+
+    - uses: actions/checkout@v7
+      if: ${{ startsWith(matrix.client, 'openssl-') }}
+      with:
+        repository: openssl/openssl
+        ref: ${{ matrix.commit }}
+        path: openssl-src
+        sparse-checkout: test/quic-openssl-docker
         persist-credentials: false
 
     - uses: actions/checkout@v7
@@ -177,14 +141,22 @@ jobs:
         docker version
         docker compose version
 
-    - uses: actions/download-artifact@v7
+    - name: Build ${{ matrix.label }}
       if: ${{ startsWith(matrix.client, 'openssl-') }}
-      with:
-        name: image-${{ matrix.label }}
-
-    - name: Load client image
-      if: ${{ startsWith(matrix.client, 'openssl-') }}
-      run: docker load < ${{ matrix.label }}.tar.gz
+      env:
+        COMMIT: ${{ matrix.commit }}
+        CURL_BRANCH: ${{ matrix.curl_branch }}
+      run: |
+        dir=openssl-src/test/quic-openssl-docker
+        old='git clone --depth 1 -b \$OPENSSL_BRANCH \$OPENSSL_URL'
+        new='git init openssl \&\& git -C openssl fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH \&\& git -C openssl checkout FETCH_HEAD'
+        sed -i "s|$old|$new|" "$dir/Dockerfile"
+        grep -qF -- 'fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH' "$dir/Dockerfile"
+        if [ -n "$CURL_BRANCH" ]; then
+            sed -i "s|clone --depth 1 https://github.com/curl/|clone --depth 1 -b $CURL_BRANCH https://github.com/curl/|" "$dir/Dockerfile"
+            grep -qF -- "-b $CURL_BRANCH " "$dir/Dockerfile"
+        fi
+        docker build -t ${{ matrix.client }} --build-arg OPENSSL_BRANCH="$COMMIT" "$dir"
 
     - name: Pull ngtcp2
       if: ${{ matrix.client == 'ngtcp2' }}
