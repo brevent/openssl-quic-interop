@@ -18,7 +18,7 @@ ORDER = "H DC LR C20 M S R Z 3 B U A L1 L2 C1 C2 6 E V2 CM BP BA".split()
 
 def entries(node):
     if isinstance(node, dict):
-        if "abbr" in node and "result" in node:
+        if "abbr" in node and node.get("result") is not None:
             yield node
         for value in node.values():
             yield from entries(value)
@@ -30,9 +30,10 @@ def entries(node):
 def load(path):
     try:
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
     except (OSError, ValueError):
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def detail(text):
@@ -94,6 +95,10 @@ def mark(result):
     return f"[{text}]({run_url})" if result == "failed" and run_url else text
 
 
+def blank(tests, measurements):
+    return "" if tests or measurements else "N/A"
+
+
 def link(name):
     if name not in urls:
         return name
@@ -138,16 +143,17 @@ print(row(["test"] + [link(c) for c, _, _ in clients]))
 print("|---|" + ":--:|" * len(clients))
 for abbr in order:
     cells = []
-    for _, tests, _ in clients:
+    for _, tests, measurements in clients:
         entry = tests.get(abbr)
-        cells.append(mark(entry["result"]) if entry else "")
+        cells.append(mark(entry["result"]) if entry
+                     else blank(tests, measurements))
     print(row([test(abbr, "")] + cells))
 for abbr in metrics:
     found = unit(abbr)
     cells = []
-    for _, _, measurements in clients:
+    for _, tests, measurements in clients:
         entry = measurements.get(abbr)
-        cell = ""
+        cell = blank(tests, measurements)
         if entry:
             cell = mark(entry["result"])
             if entry.get("details"):

@@ -53,7 +53,7 @@ jobs:
             {client: "openssl-lts", label: env.openssl_lts_branch, commit: env.openssl_lts, curl_branch: "curl-8_18_0"},
             {client: "openssl-master", label: "openssl-master", commit: env.openssl_master},
             {client: "ngtcp2", label: "ngtcp2"}
-          ] | map(select($clients == "" or (.client | IN($clients | split(",")[]))))')
+          ] | map(select($clients == "" or (.client | IN($clients | split(",")[] | gsub("\\s"; "")))))')
         echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
     - name: Resolve ngtcp2 and nginx images
@@ -197,12 +197,19 @@ jobs:
         import sys
         from testcases_quic import MEASUREMENTS, TESTCASES_QUIC
         names = {t.abbreviation(): t.name() for t in TESTCASES_QUIC + MEASUREMENTS}
-        print(",".join(names[t] for t in sys.argv[1].split(",")))
+        print(",".join(names[t.strip()] for t in sys.argv[1].split(",")))
         ' "$TESTS")
         fi
         python3 run.py -c ${{ matrix.client }} -s nginx -r nginx=nginx-interop,ngtcp2=ngtcp2-interop ${TESTS:+-t "$TESTS"} -d --log-dir logs -j result.json || true
+        if [ ! -f result.json ]; then
+            echo "::error title=$LABEL::no result"
+            exit 1
+        fi
         cp result.json "result-$LABEL.json"
-        jq -e '[.. | objects | select(has("result"))] | length > 0' result.json > /dev/null
+        if ! jq -e '[.. | objects | select(has("result")) | select(.result != null)] | length > 0' result.json > /dev/null; then
+            echo "::error title=$LABEL::no test was run"
+            exit 1
+        fi
         failed=$(jq -r '[.. | objects | select(has("result")) | select(.result != "succeeded" and .result != "unsupported") | "\(.abbr) \(.name)"] | join(", ")' result.json)
         if [ -n "$failed" ]; then
             echo "::warning title=$LABEL::failed: $failed"
@@ -277,7 +284,7 @@ jobs:
         cat summary.md >> "$GITHUB_STEP_SUMMARY"
 
     - name: Publish results
-      if: ${{ github.ref == 'refs/heads/main' && env.CLIENTS == '' && env.TESTS == '' }}
+      if: ${{ needs.resolve.result == 'success' && github.ref == 'refs/heads/main' && env.CLIENTS == '' && env.TESTS == '' }}
       env:
         GH_TOKEN: ${{ github.token }}
         TZ: Asia/Shanghai
