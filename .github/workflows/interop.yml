@@ -277,9 +277,8 @@ jobs:
             echo
             ls 20*.md | sort -rV | sed 's|\(.*\)\.md$|- [\1](\1.md)|'
         } > README.md
-        git checkout -q --orphan publish
         git add -A
         git -c user.name='github-actions[bot]' \
             -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
             commit -q -m "results of run $GITHUB_RUN_NUMBER"
-        git push -q -f "$url" publish:results
+        git push -q "$url" HEAD:results
