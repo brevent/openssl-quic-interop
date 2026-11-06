@@ -193,6 +193,7 @@ jobs:
         LABEL: ${{ matrix.label }}
       run: |
         python3 run.py -c ${{ matrix.client }} -s nginx -r nginx=nginx-interop,ngtcp2=ngtcp2-interop ${TESTS:+-t "$TESTS"} -d --log-dir logs -j result.json || true
+        cp result.json "result-$LABEL.json"
         jq -e '[.. | objects | select(has("result"))] | length > 0' result.json > /dev/null
         failed=$(jq -r '[.. | objects | select(has("result")) | select(.result != "succeeded" and .result != "unsupported") | "\(.abbr) \(.name)"] | join(", ")' result.json)
         if [ -n "$failed" ]; then
@@ -213,7 +214,7 @@ jobs:
       uses: actions/upload-artifact@v7
       with:
         name: result-${{ matrix.label }}
-        path: result.json
+        path: result-${{ matrix.label }}.json
         retention-days: 7
 
     - name: Upload logs
@@ -242,6 +243,7 @@ jobs:
     - uses: actions/download-artifact@v7
       with:
         pattern: result-*
+        merge-multiple: true
 
     - name: Summary
       env:
@@ -261,7 +263,7 @@ jobs:
         fi
         set --
         for label in $labels; do
-            set -- "$@" "$label=result-$label/result.json"
+            set -- "$@" "$label=result-$label.json"
         done
         python3 .github/summary.py "$@" > summary.md
         cat summary.md >> "$GITHUB_STEP_SUMMARY"
