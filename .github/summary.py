@@ -65,19 +65,17 @@ def row(cells):
 
 def links():
     urls = {}
-    openssl_lts = os.environ.get("OPENSSL_LTS_BRANCH", "openssl-lts")
-    for name, var in (("openssl-master", "OPENSSL_MASTER"),
-                      (openssl_lts, "OPENSSL_LTS")):
-        commit = os.environ.get(var)
-        if commit:
-            url = f"https://github.com/openssl/openssl/commit/{commit}"
-            urls[name] = (url, "")
-    for name in ("ngtcp2", "nginx"):
-        url = os.environ.get(f"{name.upper()}_URL")
-        image = os.environ.get(f"{name.upper()}_IMAGE", "")
-        _, _, digest = image.partition("@")
-        if url:
-            urls[name] = (url, digest if url.endswith("/versions") else "")
+    try:
+        matrix = json.loads(os.environ.get("MATRIX") or "[]")
+    except ValueError:
+        matrix = []
+    for entry in matrix if isinstance(matrix, list) else ():
+        if isinstance(entry, dict) and entry.get("label") and entry.get("url"):
+            urls[entry["label"]] = (entry["url"], entry.get("digest", ""))
+    url = os.environ.get("NGINX_URL")
+    _, _, digest = os.environ.get("NGINX_IMAGE", "").partition("@")
+    if url:
+        urls["nginx"] = (url, digest if url.endswith("/versions") else "")
     return urls
 
 
@@ -139,7 +137,11 @@ if number and run_url:
     print()
 print(f"server: {link('nginx')}")
 print()
-print(row(["test"] + [link(c) for c, _, _ in clients]))
+print("clients:")
+for c, _, _ in clients:
+    print(f"- {link(c)}")
+print()
+print(row(["test"] + [escape(c) for c, _, _ in clients]))
 print("|---|" + ":--:|" * len(clients))
 for abbr in order:
     cells = []

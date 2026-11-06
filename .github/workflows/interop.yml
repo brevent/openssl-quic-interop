@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       clients:
-        description: "Clients, comma separated (openssl-lts, openssl-master, ngtcp2); empty for all"
+        description: "Clients, comma separated (openssl-lts, openssl-master, or a runner client such as ngtcp2, quic-go); empty for openssl-lts,openssl-master,ngtcp2"
         default: ""
       tests:
         description: "Tests, comma separated (e.g. BP,BA); empty for all"
@@ -32,12 +32,8 @@ jobs:
     permissions:
       packages: read
     outputs:
-      openssl_lts: ${{ steps.openssl.outputs.openssl_lts }}
       openssl_lts_branch: ${{ steps.openssl.outputs.openssl_lts_branch }}
-      openssl_master: ${{ steps.openssl.outputs.openssl_master }}
-      matrix: ${{ steps.openssl.outputs.matrix }}
-      ngtcp2_image: ${{ steps.images.outputs.ngtcp2_image }}
-      ngtcp2_url: ${{ steps.images.outputs.ngtcp2_url }}
+      matrix: ${{ steps.images.outputs.matrix }}
       nginx_image: ${{ steps.images.outputs.nginx_image }}
       nginx_url: ${{ steps.images.outputs.nginx_url }}
 
@@ -54,19 +50,64 @@ jobs:
         echo "openssl_lts_branch=$lts" >> "$GITHUB_OUTPUT"
         resolve_commit openssl_lts "$lts"
         resolve_commit openssl_master master
-        set -a; . "$GITHUB_OUTPUT"; set +a
-        matrix=$(jq -nc --arg clients "$CLIENTS" '[
-            {client: "openssl-lts", label: env.openssl_lts_branch, commit: env.openssl_lts, curl_branch: "curl-8_18_0"},
-            {client: "openssl-master", label: "openssl-master", commit: env.openssl_master},
-            {client: "ngtcp2", label: "ngtcp2"}
-          ] | map(select($clients == "" or (.client | IN($clients | split(",")[] | gsub("\\s"; "")))))')
-        echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
-    - name: Resolve ngtcp2 and nginx images
+    - name: Resolve clients and nginx image
       id: images
       env:
         GH_TOKEN: ${{ github.token }}
+        LTS_BRANCH: ${{ steps.openssl.outputs.openssl_lts_branch }}
+        LTS_COMMIT: ${{ steps.openssl.outputs.openssl_lts }}
+        MASTER_COMMIT: ${{ steps.openssl.outputs.openssl_master }}
       run: |
+        impl=$(curl -fsSL https://raw.githubusercontent.com/quic-interop/quic-interop-runner/master/implementations_quic.json)
+        resolve_client() {
+            client=$1
+            image=$(jq -er --arg c "$client" '.[$c] | select(.role == "client" or .role == "both") | .image' <<< "$impl") || {
+                echo "::error::unknown client: $client"
+                exit 1
+            }
+            digest=$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')
+            url= shown=$digest
+            case $image in
+            ghcr.io/*)
+                path=${image#ghcr.io/} owner=${path%%/*} package=${path#*/}
+                package=$(jq -rn --arg p "${package%:*}" '$p | @uri')
+                id=$(gh api "/orgs/$owner/packages/container/$package/versions" \
+                    --jq ".[] | select(.name == \"$digest\") | .id") || true
+                if [ -n "$id" ]; then
+                    url=https://github.com/orgs/$owner/packages/container/$package/$id shown=
+                fi
+                ;;
+            esac
+            [ -n "$url" ] || url=$(jq -r --arg c "$client" '.[$c].url' <<< "$impl")
+            entry=$(jq -nc --arg c "$client" --arg image "$image@$digest" --arg url "$url" --arg digest "$shown" \
+                '{client: $c, label: $c, image: $image, url: $url, digest: $digest}')
+        }
+        matrix='[]'
+        for client in $(tr ',' ' ' <<< "${CLIENTS:-openssl-lts,openssl-master,ngtcp2}"); do
+            if jq -e --arg c "$client" 'any(.[]; .client == $c)' <<< "$matrix" > /dev/null; then
+                continue
+            fi
+            case $client in
+            openssl-lts)
+                entry=$(jq -nc --arg label "$LTS_BRANCH" --arg commit "$LTS_COMMIT" \
+                    '{client: "openssl-lts", label: $label, commit: $commit, curl_branch: "curl-8_18_0",
+                      url: "https://github.com/openssl/openssl/commit/\($commit)"}') ;;
+            openssl-master)
+                entry=$(jq -nc --arg commit "$MASTER_COMMIT" \
+                    '{client: "openssl-master", label: "openssl-master", commit: $commit,
+                      url: "https://github.com/openssl/openssl/commit/\($commit)"}') ;;
+            *)
+                resolve_client "$client" ;;
+            esac
+            matrix=$(jq -c --argjson e "$entry" '. + [$e]' <<< "$matrix")
+        done
+        if [ "$matrix" = '[]' ]; then
+            echo "::error::no clients selected"
+            exit 1
+        fi
+        echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
         resolve_image() {
             name=$1 repo=$2 package=$3
             org=${repo%%/*}
@@ -77,7 +118,6 @@ jobs:
             echo "${name}_image=$image@$digest" >> "$GITHUB_OUTPUT"
             echo "${name}_url=https://github.com/$repo/pkgs/container/$package/${id:-versions}" >> "$GITHUB_OUTPUT"
         }
-        resolve_image ngtcp2 ngtcp2/ngtcp2 ngtcp2-interop
         resolve_image nginx "$NGINX/nginx-quic-qns" nginx-quic-qns
 
   interop:
@@ -141,8 +181,8 @@ jobs:
     - name: Patch implementations file
       run: |
         jq '. + {
-              "openssl-lts": {image: "openssl-lts", url: "https://github.com/openssl/openssl", role: "client"},
-              "openssl-master": {image: "openssl-master", url: "https://github.com/openssl/openssl", role: "client"}
+              "openssl-lts": {image: "openssl-lts-interop", url: "https://github.com/openssl/openssl", role: "client"},
+              "openssl-master": {image: "openssl-master-interop", url: "https://github.com/openssl/openssl", role: "client"}
             }' implementations_quic.json > implementations.tmp
         mv implementations.tmp implementations_quic.json
 
@@ -176,15 +216,15 @@ jobs:
             sed -i "s|clone --depth 1 https://github.com/curl/|clone --depth 1 -b $CURL_BRANCH https://github.com/curl/|" "$dir/Dockerfile"
             grep -qF -- "-b $CURL_BRANCH " "$dir/Dockerfile"
         fi
-        docker build -t "${{ matrix.client }}" --build-arg OPENSSL_BRANCH="$COMMIT" "$dir"
+        docker build -t "${{ matrix.client }}-interop" --build-arg OPENSSL_BRANCH="$COMMIT" "$dir"
 
-    - name: Pull ngtcp2
-      if: ${{ matrix.client == 'ngtcp2' }}
+    - name: Pull ${{ matrix.label }}
+      if: ${{ matrix.image }}
       env:
-        NGTCP2_IMAGE: ${{ needs.resolve.outputs.ngtcp2_image }}
+        IMAGE: ${{ matrix.image }}
       run: |
-        docker pull "$NGTCP2_IMAGE"
-        docker tag "$NGTCP2_IMAGE" ngtcp2-interop
+        docker pull "$IMAGE"
+        docker tag "$IMAGE" "${{ matrix.client }}-interop"
 
     - name: Pull nginx
       env:
@@ -206,7 +246,7 @@ jobs:
         print(",".join(names[t.strip()] for t in sys.argv[1].split(",")))
         ' "$TESTS")
         fi
-        python3 run.py -c ${{ matrix.client }} -s nginx -r nginx=nginx-interop,ngtcp2=ngtcp2-interop ${TESTS:+-t "$TESTS"} -d --log-dir logs -j result.json || true
+        python3 run.py -c ${{ matrix.client }} -s nginx -r nginx=nginx-interop,${{ matrix.client }}=${{ matrix.client }}-interop ${TESTS:+-t "$TESTS"} -d --log-dir logs -j result.json || true
         if [ ! -f result.json ]; then
             echo "::error title=$LABEL::no result"
             exit 1
@@ -268,11 +308,7 @@ jobs:
 
     - name: Summary
       env:
-        OPENSSL_LTS: ${{ needs.resolve.outputs.openssl_lts }}
         OPENSSL_LTS_BRANCH: ${{ needs.resolve.outputs.openssl_lts_branch }}
-        OPENSSL_MASTER: ${{ needs.resolve.outputs.openssl_master }}
-        NGTCP2_IMAGE: ${{ needs.resolve.outputs.ngtcp2_image }}
-        NGTCP2_URL: ${{ needs.resolve.outputs.ngtcp2_url }}
         NGINX_IMAGE: ${{ needs.resolve.outputs.nginx_image }}
         NGINX_URL: ${{ needs.resolve.outputs.nginx_url }}
         MATRIX: ${{ needs.resolve.outputs.matrix }}
