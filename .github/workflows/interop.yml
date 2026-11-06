@@ -6,8 +6,19 @@ on:
   schedule:
     - cron: "20 3 * * *"
   workflow_dispatch:
+    inputs:
+      clients:
+        description: "Clients, comma separated (openssl-lts, openssl-master, ngtcp2); empty for all"
+        default: ""
+      tests:
+        description: "Tests, comma separated (e.g. rebind-port,rebind-addr); empty for all"
+        default: ""
 
 permissions: {}
+
+env:
+  CLIENTS: ${{ inputs.clients }}
+  TESTS: ${{ inputs.tests }}
 
 jobs:
   resolve:
@@ -18,6 +29,7 @@ jobs:
       openssl_lts: ${{ steps.openssl.outputs.openssl_lts }}
       openssl_lts_branch: ${{ steps.openssl.outputs.openssl_lts_branch }}
       openssl_master: ${{ steps.openssl.outputs.openssl_master }}
+      matrix: ${{ steps.openssl.outputs.matrix }}
       ngtcp2_image: ${{ steps.images.outputs.ngtcp2_image }}
       ngtcp2_url: ${{ steps.images.outputs.ngtcp2_url }}
       nginx_image: ${{ steps.images.outputs.nginx_image }}
@@ -36,6 +48,13 @@ jobs:
         echo "openssl_lts_branch=$lts" >> "$GITHUB_OUTPUT"
         resolve_commit openssl_lts "$lts"
         resolve_commit openssl_master master
+        set -a; . "$GITHUB_OUTPUT"; set +a
+        matrix=$(jq -nc --arg clients "$CLIENTS" '[
+            {client: "openssl-lts", label: env.openssl_lts_branch, commit: env.openssl_lts, curl_branch: "curl-8_18_0"},
+            {client: "openssl-master", label: "openssl-master", commit: env.openssl_master},
+            {client: "ngtcp2", label: "ngtcp2"}
+          ] | map(select($clients == "" or (.client | IN($clients | split(",")[]))))')
+        echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
     - name: Resolve ngtcp2 and nginx images
       id: images
@@ -61,16 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - client: openssl-lts
-            label: ${{ needs.resolve.outputs.openssl_lts_branch }}
-            commit: ${{ needs.resolve.outputs.openssl_lts }}
-            curl_branch: curl-8_18_0
-          - client: openssl-master
-            label: openssl-master
-            commit: ${{ needs.resolve.outputs.openssl_master }}
-          - client: ngtcp2
-            label: ngtcp2
+        include: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     runs-on: ubuntu-26.04
 
     steps:
@@ -182,7 +192,7 @@ jobs:
       env:
         LABEL: ${{ matrix.label }}
       run: |
-        python3 run.py -c ${{ matrix.client }} -s nginx -r nginx=nginx-interop,ngtcp2=ngtcp2-interop -d --log-dir logs -j result.json || true
+        python3 run.py -c ${{ matrix.client }} -s nginx -r nginx=nginx-interop,ngtcp2=ngtcp2-interop ${TESTS:+-t "$TESTS"} -d --log-dir logs -j result.json || true
         jq -e '[.. | objects | select(has("result"))] | length > 0' result.json > /dev/null
         failed=$(jq -r '[.. | objects | select(has("result")) | select(.result != "succeeded" and .result != "unsupported") | "\(.abbr) \(.name)"] | join(", ")' result.json)
         if [ -n "$failed" ]; then
@@ -242,16 +252,22 @@ jobs:
         NGTCP2_URL: ${{ needs.resolve.outputs.ngtcp2_url }}
         NGINX_IMAGE: ${{ needs.resolve.outputs.nginx_image }}
         NGINX_URL: ${{ needs.resolve.outputs.nginx_url }}
+        MATRIX: ${{ needs.resolve.outputs.matrix }}
       run: |
-        lts=${OPENSSL_LTS_BRANCH:-openssl-lts}
-        python3 .github/summary.py \
-            "$lts"="result-$lts/result.json" \
-            openssl-master=result-openssl-master/result.json \
-            ngtcp2=result-ngtcp2/result.json > summary.md
+        if [ -n "$MATRIX" ]; then
+            labels=$(jq -r '.[].label' <<< "$MATRIX")
+        else
+            labels="${OPENSSL_LTS_BRANCH:-openssl-lts} openssl-master ngtcp2"
+        fi
+        set --
+        for label in $labels; do
+            set -- "$@" "$label=result-$label/result.json"
+        done
+        python3 .github/summary.py "$@" > summary.md
         cat summary.md >> "$GITHUB_STEP_SUMMARY"
 
     - name: Publish results
-      if: ${{ github.ref == 'refs/heads/main' }}
+      if: ${{ github.ref == 'refs/heads/main' && env.CLIENTS == '' && env.TESTS == '' }}
       env:
         GH_TOKEN: ${{ github.token }}
         TZ: Asia/Shanghai
