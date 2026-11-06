@@ -67,8 +67,23 @@ jobs:
                 exit 1
             }
             digest=$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')
-            url= shown=$digest
-            case $image in
+            name=$(docker buildx imagetools inspect "$image" | grep -m 1 '^Name:' | awk '{ print $2 }')
+            if [ -z "$name" ]; then
+                echo "::error::$client: cannot resolve image name for $image"
+                exit 1
+            fi
+            url=https://$name shown=$digest
+            case $name in
+            docker.io/*)
+                path=${name#docker.io/} path=${path%@*}
+                repository=${path##*/} repository=${repository%%:*}
+                namespace=${path%/*}
+                if [ "$namespace" = library ]; then
+                    url=https://hub.docker.com/_/$repository
+                else
+                    url=https://hub.docker.com/r/$namespace/$repository
+                fi
+                ;;
             ghcr.io/*)
                 path=${image#ghcr.io/} owner=${path%%/*} package=${path#*/}
                 package=$(jq -rn --arg p "${package%:*}" '$p | @uri')
@@ -79,7 +94,6 @@ jobs:
                 fi
                 ;;
             esac
-            [ -n "$url" ] || url=$(jq -r --arg c "$client" '.[$c].url' <<< "$impl")
             entry=$(jq -nc --arg c "$client" --arg image "$image@$digest" --arg url "$url" --arg digest "$shown" \
                 '{client: $c, label: $c, image: $image, url: $url, digest: $digest}')
         }
