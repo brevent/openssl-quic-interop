@@ -13,12 +13,18 @@ on:
       tests:
         description: "Tests, comma separated (e.g. BP,BA); empty for all"
         default: ""
+      nginx:
+        description: "nginx image: brevent (patched) or nginx (upstream)"
+        type: choice
+        options: [ brevent, nginx ]
+        default: brevent
 
 permissions: {}
 
 env:
   CLIENTS: ${{ inputs.clients }}
   TESTS: ${{ inputs.tests }}
+  NGINX: ${{ inputs.nginx || 'brevent' }}
 
 jobs:
   resolve:
@@ -72,7 +78,7 @@ jobs:
             echo "${name}_url=https://github.com/$repo/pkgs/container/$package/${id:-versions}" >> "$GITHUB_OUTPUT"
         }
         resolve_image ngtcp2 ngtcp2/ngtcp2 ngtcp2-interop
-        resolve_image nginx brevent/nginx-quic-qns nginx-quic-qns
+        resolve_image nginx "$NGINX/nginx-quic-qns" nginx-quic-qns
 
   interop:
     needs: resolve
