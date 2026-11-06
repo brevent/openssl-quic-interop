@@ -11,7 +11,7 @@ on:
         description: "Clients, comma separated (openssl-lts, openssl-master, ngtcp2); empty for all"
         default: ""
       tests:
-        description: "Tests, comma separated (e.g. rebind-port,rebind-addr); empty for all"
+        description: "Tests, comma separated (e.g. BP,BA); empty for all"
         default: ""
 
 permissions: {}
@@ -187,11 +187,19 @@ jobs:
         docker pull "$NGINX_IMAGE"
         docker tag "$NGINX_IMAGE" nginx-interop
 
-    - name: Run all tests
+    - name: Run tests
       id: run
       env:
         LABEL: ${{ matrix.label }}
       run: |
+        if [ -n "$TESTS" ]; then
+            TESTS=$(python3 -c '
+        import sys
+        from testcases_quic import MEASUREMENTS, TESTCASES_QUIC
+        names = {t.abbreviation(): t.name() for t in TESTCASES_QUIC + MEASUREMENTS}
+        print(",".join(names[t] for t in sys.argv[1].split(",")))
+        ' "$TESTS")
+        fi
         python3 run.py -c ${{ matrix.client }} -s nginx -r nginx=nginx-interop,ngtcp2=ngtcp2-interop ${TESTS:+-t "$TESTS"} -d --log-dir logs -j result.json || true
         cp result.json "result-$LABEL.json"
         jq -e '[.. | objects | select(has("result"))] | length > 0' result.json > /dev/null
@@ -201,7 +209,7 @@ jobs:
             echo "failed=true" >> "$GITHUB_OUTPUT"
         fi
 
-    - name: Remove successful logs
+    - name: Keep only failed logs
       if: ${{ steps.run.outputs.failed == 'true' }}
       run: |
         jq -r '(.results[][], .measurements[][]) | select(.result == "succeeded") | .name' result.json |
