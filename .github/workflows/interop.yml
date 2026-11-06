@@ -177,19 +177,12 @@ jobs:
     - name: Update apt repos
       timeout-minutes: 5
       run: |
-        sudo apt-get \
-          -o Acquire::Retries=5 \
-          -o Acquire::http::Timeout=15 \
-          -o Acquire::https::Timeout=15 \
-          update
+        .openssl/.github/retry sudo timeout 90 apt-get update
 
     - name: Install tshark
       timeout-minutes: 5
       run: |
-        sudo apt-get \
-          -o Acquire::Retries=5 \
-          -o Acquire::http::Timeout=15 \
-          -o Acquire::https::Timeout=15 \
+        .openssl/.github/retry sudo timeout 90 apt-get \
           install -y --no-install-recommends tshark
 
     - name: Patch implementations file
@@ -215,12 +208,17 @@ jobs:
         docker version
         docker compose version
 
-    - name: Build ${{ matrix.label }}
-      if: ${{ startsWith(matrix.client, 'openssl-') }}
+    - name: Prepare ${{ matrix.label }}
       env:
+        IMAGE: ${{ matrix.image }}
         COMMIT: ${{ matrix.commit }}
         CURL_BRANCH: ${{ matrix.curl_branch }}
       run: |
+        if [ -n "$IMAGE" ]; then
+            docker pull "$IMAGE"
+            docker tag "$IMAGE" "${{ matrix.client }}-interop"
+            exit
+        fi
         dir=openssl-src/test/quic-openssl-docker
         old='git clone --depth 1 -b \$OPENSSL_BRANCH \$OPENSSL_URL'
         new='git init openssl \&\& git -C openssl fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH \&\& git -C openssl checkout FETCH_HEAD'
@@ -231,14 +229,6 @@ jobs:
             grep -qF -- "-b $CURL_BRANCH " "$dir/Dockerfile"
         fi
         docker build -t "${{ matrix.client }}-interop" --build-arg OPENSSL_BRANCH="$COMMIT" "$dir"
-
-    - name: Pull ${{ matrix.label }}
-      if: ${{ matrix.image }}
-      env:
-        IMAGE: ${{ matrix.image }}
-      run: |
-        docker pull "$IMAGE"
-        docker tag "$IMAGE" "${{ matrix.client }}-interop"
 
     - name: Pull nginx
       env:
