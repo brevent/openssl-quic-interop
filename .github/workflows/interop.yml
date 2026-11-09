@@ -290,7 +290,7 @@ jobs:
         path: logs
         retention-days: 7
 
-  summary:
+  results:
     needs: [ resolve, interop ]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-26.04
@@ -310,7 +310,7 @@ jobs:
         pattern: result-*
         merge-multiple: true
 
-    - name: Summary
+    - name: Generate summary
       env:
         OPENSSL_LTS_BRANCH: ${{ needs.resolve.outputs.openssl_lts_branch }}
         NGINX_IMAGE: ${{ needs.resolve.outputs.nginx_image }}
