@@ -40,6 +40,7 @@ jobs:
     steps:
     - name: Resolve openssl commits
       id: openssl
+      if: ${{ env.CLIENTS == '' || contains(env.CLIENTS, 'openssl-lts') || contains(env.CLIENTS, 'openssl-master') }}
       run: |
         resolve_commit() {
             commit=$(git ls-remote https://github.com/openssl/openssl.git "refs/heads/$2" | cut -f1)
@@ -159,31 +160,29 @@ jobs:
         sparse-checkout: test/quic-openssl-docker
         persist-credentials: false
 
-    - uses: actions/checkout@v7
-      with:
-        repository: openssl/openssl
-        path: .openssl
-        sparse-checkout: .github/retry
-        sparse-checkout-cone-mode: false
-        persist-credentials: false
-
     - uses: actions/setup-python@v6
       with:
         python-version: "3.12"
 
     - name: Install python requirements
-      run: .openssl/.github/retry timeout 300 pip install -r requirements.txt
-
-    - name: Update apt repos
       timeout-minutes: 5
       run: |
-        .openssl/.github/retry sudo timeout 90 apt-get update
+        for _ in 1 2 3; do
+            timeout 60 pip install -r requirements.txt && exit 0
+            sleep 5
+        done
+        exit 1
 
     - name: Install tshark
       timeout-minutes: 5
       run: |
-        .openssl/.github/retry sudo timeout 90 apt-get \
-          install -y --no-install-recommends tshark
+        for _ in 1 2 3; do
+            sudo timeout 60 apt-get update &&
+                sudo timeout 60 apt-get install -y --no-install-recommends tshark &&
+                exit 0
+            sleep 5
+        done
+        exit 1
 
     - name: Patch implementations file
       run: |
