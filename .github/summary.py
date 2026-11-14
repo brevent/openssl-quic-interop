@@ -73,9 +73,8 @@ def links():
         if isinstance(entry, dict) and entry.get("label") and entry.get("url"):
             urls[entry["label"]] = (entry["url"], entry.get("digest", ""))
     url = os.environ.get("NGINX_URL")
-    _, _, digest = os.environ.get("NGINX_IMAGE", "").partition("@")
     if url:
-        urls["nginx"] = (url, digest if url.endswith("/versions") else "")
+        urls["nginx"] = (url, os.environ.get("NGINX_DIGEST", ""))
     return urls
 
 

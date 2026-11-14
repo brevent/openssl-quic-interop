@@ -1,4 +1,4 @@
-name: OpenSSL QUIC interop
+name: QUIC interop
 
 on:
   push:
@@ -8,23 +8,21 @@ on:
   workflow_dispatch:
     inputs:
       clients:
-        description: "Clients, comma separated (openssl-lts, openssl-master, or a runner client such as ngtcp2, quic-go); empty for openssl-lts,openssl-master,ngtcp2"
+        description: "Clients, comma separated, default openssl-lts,openssl-master,ngtcp2"
         default: ""
       tests:
-        description: "Tests, comma separated (e.g. BP,BA); empty for all"
+        description: "Tests, comma separated, default all"
         default: ""
-      nginx:
-        description: "nginx image: brevent (patched) or nginx (upstream)"
-        type: choice
-        options: [ brevent, nginx ]
-        default: brevent
+      nginx_commit:
+        description: "Build nginx with commit (or branch, tag, pull/ID)"
+        default: ""
 
 permissions: {}
 
 env:
   CLIENTS: ${{ inputs.clients }}
   TESTS: ${{ inputs.tests }}
-  NGINX: ${{ inputs.nginx || 'brevent' }}
+  NGINX_COMMIT: ${{ inputs.nginx_commit }}
 
 jobs:
   resolve:
@@ -36,6 +34,8 @@ jobs:
       matrix: ${{ steps.images.outputs.matrix }}
       nginx_image: ${{ steps.images.outputs.nginx_image }}
       nginx_url: ${{ steps.images.outputs.nginx_url }}
+      nginx_commit: ${{ steps.images.outputs.nginx_commit }}
+      nginx_digest: ${{ steps.images.outputs.nginx_digest }}
 
     steps:
     - name: Resolve openssl commits
@@ -52,7 +52,7 @@ jobs:
         resolve_commit openssl_lts "$lts"
         resolve_commit openssl_master master
 
-    - name: Resolve clients and nginx image
+    - name: Resolve clients and nginx
       id: images
       env:
         GH_TOKEN: ${{ github.token }}
@@ -73,7 +73,7 @@ jobs:
                 echo "::error::$client: cannot resolve image name for $image"
                 exit 1
             fi
-            url=https://$name shown=$digest
+            url=https://$name
             case $name in
             docker.io/*)
                 path=${name#docker.io/} path=${path%@*}
@@ -91,11 +91,11 @@ jobs:
                 id=$(gh api "/orgs/$owner/packages/container/$package/versions" \
                     --jq ".[] | select(.name == \"$digest\") | .id") || true
                 if [ -n "$id" ]; then
-                    url=https://github.com/orgs/$owner/packages/container/$package/$id shown=
+                    url=https://github.com/orgs/$owner/packages/container/$package/$id
                 fi
                 ;;
             esac
-            entry=$(jq -nc --arg c "$client" --arg image "$image@$digest" --arg url "$url" --arg digest "$shown" \
+            entry=$(jq -nc --arg c "$client" --arg image "$image@$digest" --arg url "$url" --arg digest "$digest" \
                 '{client: $c, label: $c, image: $image, url: $url, digest: $digest}')
         }
         matrix='[]'
@@ -107,11 +107,11 @@ jobs:
             openssl-lts)
                 entry=$(jq -nc --arg label "$LTS_BRANCH" --arg commit "$LTS_COMMIT" \
                     '{client: "openssl-lts", label: $label, commit: $commit, curl_branch: "curl-8_18_0",
-                      url: "https://github.com/openssl/openssl/commit/\($commit)"}') ;;
+                      url: "https://github.com/openssl/openssl/commit/\($commit)", digest: $commit[0:12]}') ;;
             openssl-master)
                 entry=$(jq -nc --arg commit "$MASTER_COMMIT" \
                     '{client: "openssl-master", label: "openssl-master", commit: $commit,
-                      url: "https://github.com/openssl/openssl/commit/\($commit)"}') ;;
+                      url: "https://github.com/openssl/openssl/commit/\($commit)", digest: $commit[0:12]}') ;;
             *)
                 resolve_client "$client" ;;
             esac
@@ -132,11 +132,71 @@ jobs:
                 --jq ".[] | select(.name == \"$digest\") | .id") || true
             echo "${name}_image=$image@$digest" >> "$GITHUB_OUTPUT"
             echo "${name}_url=https://github.com/$repo/pkgs/container/$package/${id:-versions}" >> "$GITHUB_OUTPUT"
+            echo "${name}_digest=$digest" >> "$GITHUB_OUTPUT"
         }
-        resolve_image nginx "$NGINX/nginx-quic-qns" nginx-quic-qns
+
+        if [ -z "$NGINX_COMMIT" ]; then
+            resolve_image nginx brevent/nginx-quic-qns nginx-quic-qns
+        else
+            ref=$NGINX_COMMIT
+            if [[ $ref == pull/* ]]; then ref=$ref/head; fi
+            git init -q nginx
+            git -C nginx fetch -q --depth=1 https://github.com/nginx/nginx "$ref" || {
+                echo "::error::cannot fetch $ref from nginx/nginx"
+                exit 1
+            }
+            commit=$(git -C nginx rev-parse FETCH_HEAD^{commit})
+            case $NGINX_COMMIT in
+            pull/*)
+                url=https://github.com/nginx/nginx/$NGINX_COMMIT
+                digest="$NGINX_COMMIT ${commit:0:12}"
+                ;;
+            "$commit")
+                url=https://github.com/nginx/nginx/commit/$commit
+                digest=${commit:0:12}
+                ;;
+            *)
+                url=https://github.com/nginx/nginx/commit/$commit
+                digest="$NGINX_COMMIT ${commit:0:12}"
+                ;;
+            esac
+            {
+                echo "nginx_commit=$commit"
+                echo "nginx_url=$url"
+                echo "nginx_digest=$digest"
+            } >> "$GITHUB_OUTPUT"
+        fi
+
+  nginx:
+    needs: resolve
+    runs-on: ubuntu-26.04
+
+    steps:
+    - uses: actions/checkout@v7
+      if: ${{ needs.resolve.outputs.nginx_commit != '' }}
+      with:
+        repository: brevent/nginx-quic-qns
+        persist-credentials: false
+
+    - name: Build nginx
+      if: ${{ needs.resolve.outputs.nginx_commit != '' }}
+      env:
+        NGINX_COMMIT: ${{ needs.resolve.outputs.nginx_commit }}
+      run: |
+        docker build -t nginx-interop --build-arg NGINX_COMMIT="$NGINX_COMMIT" .
+        docker run --rm --entrypoint /usr/sbin/nginx nginx-interop -V 2>&1 | tee nginx-V
+        grep -qF -- "$NGINX_COMMIT" nginx-V
+        docker save nginx-interop | zstd -T0 -3 -o nginx-interop.tar.zst
+
+    - uses: actions/upload-artifact@v7
+      if: ${{ needs.resolve.outputs.nginx_commit != '' }}
+      with:
+        name: nginx-image
+        path: nginx-interop.tar.zst
+        retention-days: 1
 
   interop:
-    needs: resolve
+    needs: [ resolve, nginx ]
     name: interop (${{ matrix.label }})
     strategy:
       fail-fast: false
@@ -229,10 +289,19 @@ jobs:
         fi
         docker build -t "${{ matrix.client }}-interop" --build-arg OPENSSL_BRANCH="$COMMIT" "$dir"
 
-    - name: Pull nginx
+    - uses: actions/download-artifact@v7
+      if: ${{ needs.resolve.outputs.nginx_commit != '' }}
+      with:
+        name: nginx-image
+
+    - name: Prepare nginx
       env:
         NGINX_IMAGE: ${{ needs.resolve.outputs.nginx_image }}
       run: |
+        if [ -z "$NGINX_IMAGE" ]; then
+            zstd -dc nginx-interop.tar.zst | docker load
+            exit
+        fi
         docker pull "$NGINX_IMAGE"
         docker tag "$NGINX_IMAGE" nginx-interop
 
@@ -312,8 +381,8 @@ jobs:
     - name: Generate summary
       env:
         OPENSSL_LTS_BRANCH: ${{ needs.resolve.outputs.openssl_lts_branch }}
-        NGINX_IMAGE: ${{ needs.resolve.outputs.nginx_image }}
         NGINX_URL: ${{ needs.resolve.outputs.nginx_url }}
+        NGINX_DIGEST: ${{ needs.resolve.outputs.nginx_digest }}
         MATRIX: ${{ needs.resolve.outputs.matrix }}
       run: |
         if [ -n "$MATRIX" ]; then
@@ -329,7 +398,7 @@ jobs:
         cat summary.md >> "$GITHUB_STEP_SUMMARY"
 
     - name: Publish results
-      if: ${{ needs.resolve.result == 'success' && github.ref == 'refs/heads/main' && env.CLIENTS == '' && env.TESTS == '' }}
+      if: ${{ needs.resolve.result == 'success' && github.ref == 'refs/heads/main' && env.CLIENTS == '' && env.TESTS == '' && env.NGINX_COMMIT == '' }}
       env:
         GH_TOKEN: ${{ github.token }}
         TZ: Asia/Shanghai
