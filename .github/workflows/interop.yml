@@ -8,19 +8,19 @@ on:
   workflow_dispatch:
     inputs:
       clients:
-        description: "Clients, comma separated, default openssl-lts,openssl-master,ngtcp2"
+        description: "Clients, comma separated, default all"
         default: ""
       tests:
         description: "Tests, comma separated, default all"
         default: ""
       nginx_commit:
-        description: "Build nginx with commit (or branch, tag, pull/ID)"
+        description: "Build nginx with commit (or branch, tag, pull/ID), default prebuilt master"
         default: ""
 
 permissions: {}
 
 env:
-  CLIENTS: ${{ inputs.clients }}
+  CLIENTS: ${{ github.event_name == 'schedule' && 'openssl-lts,openssl-master,ngtcp2' || inputs.clients }}
   TESTS: ${{ inputs.tests }}
   NGINX_COMMIT: ${{ inputs.nginx_commit }}
 
@@ -41,7 +41,7 @@ jobs:
     steps:
     - name: Resolve openssl commits
       id: openssl
-      if: ${{ env.CLIENTS == '' || contains(env.CLIENTS, 'openssl-lts') || contains(env.CLIENTS, 'openssl-master') }}
+      if: ${{ env.CLIENTS == '' || contains(env.CLIENTS, 'openssl-') }}
       run: |
         resolve_commit() {
             commit=$(git ls-remote https://github.com/openssl/openssl.git "refs/heads/$2" | cut -f1)
@@ -99,8 +99,12 @@ jobs:
             entry=$(jq -nc --arg c "$client" --arg image "$image@$digest" --arg url "$url" --arg digest "$digest" \
                 '{client: $c, label: $c, image: $image, url: $url, digest: $digest}')
         }
+        if [ -z "$CLIENTS" ]; then
+            CLIENTS=openssl-lts,openssl-master,$(jq -r 'to_entries[]
+                | select(.value.role == "client" or .value.role == "both") | .key' <<< "$impl" | tr '\n' ,)
+        fi
         matrix='[]'
-        for client in $(tr ',' ' ' <<< "${CLIENTS:-openssl-lts,openssl-master,ngtcp2}"); do
+        for client in $(tr ',' ' ' <<< "$CLIENTS"); do
             if jq -e --arg c "$client" 'any(.[]; .client == $c)' <<< "$matrix" > /dev/null; then
                 continue
             fi
@@ -405,7 +409,7 @@ jobs:
         cat summary.md >> "$GITHUB_STEP_SUMMARY"
 
     - name: Publish results
-      if: ${{ needs.resolve.result == 'success' && github.ref == 'refs/heads/main' && env.CLIENTS == '' && env.TESTS == '' && env.NGINX_COMMIT == '' }}
+      if: ${{ needs.resolve.result == 'success' && github.event_name == 'schedule' }}
       env:
         GH_TOKEN: ${{ github.token }}
         TZ: Asia/Shanghai
