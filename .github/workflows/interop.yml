@@ -33,6 +33,7 @@ jobs:
       openssl_lts_branch: ${{ steps.openssl.outputs.openssl_lts_branch }}
       matrix: ${{ steps.images.outputs.matrix }}
       nginx_image: ${{ steps.images.outputs.nginx_image }}
+      nginx_label: ${{ steps.images.outputs.nginx_label }}
       nginx_url: ${{ steps.images.outputs.nginx_url }}
       nginx_commit: ${{ steps.images.outputs.nginx_commit }}
       nginx_digest: ${{ steps.images.outputs.nginx_digest }}
@@ -105,13 +106,13 @@ jobs:
             fi
             case $client in
             openssl-lts)
-                entry=$(jq -nc --arg label "$LTS_BRANCH" --arg commit "$LTS_COMMIT" \
+                entry=$(jq -nc --arg label "$LTS_BRANCH" --arg commit "$LTS_COMMIT" --arg digest "${LTS_COMMIT:0:12}" \
                     '{client: "openssl-lts", label: $label, commit: $commit, curl_branch: "curl-8_18_0",
-                      url: "https://github.com/openssl/openssl/commit/\($commit)", digest: $commit[0:12]}') ;;
+                      url: "https://github.com/openssl/openssl/commit/\($commit)", digest: $digest}') ;;
             openssl-master)
-                entry=$(jq -nc --arg commit "$MASTER_COMMIT" \
+                entry=$(jq -nc --arg commit "$MASTER_COMMIT" --arg digest "${MASTER_COMMIT:0:12}" \
                     '{client: "openssl-master", label: "openssl-master", commit: $commit,
-                      url: "https://github.com/openssl/openssl/commit/\($commit)", digest: $commit[0:12]}') ;;
+                      url: "https://github.com/openssl/openssl/commit/\($commit)", digest: $digest}') ;;
             *)
                 resolve_client "$client" ;;
             esac
@@ -148,20 +149,24 @@ jobs:
             commit=$(git -C nginx rev-parse FETCH_HEAD^{commit})
             case $NGINX_COMMIT in
             pull/*)
+                label=nginx/nginx#${NGINX_COMMIT#pull/}
                 url=https://github.com/nginx/nginx/$NGINX_COMMIT
-                digest="$NGINX_COMMIT ${commit:0:12}"
-                ;;
-            "$commit")
-                url=https://github.com/nginx/nginx/commit/$commit
                 digest=${commit:0:12}
                 ;;
-            *)
+            "$commit")
+                label=nginx/nginx@${commit:0:12}
                 url=https://github.com/nginx/nginx/commit/$commit
-                digest="$NGINX_COMMIT ${commit:0:12}"
+                digest=
+                ;;
+            *)
+                label=nginx/nginx@$NGINX_COMMIT
+                url=https://github.com/nginx/nginx/commit/$commit
+                digest=${commit:0:12}
                 ;;
             esac
             {
                 echo "nginx_commit=$commit"
+                echo "nginx_label=$label"
                 echo "nginx_url=$url"
                 echo "nginx_digest=$digest"
             } >> "$GITHUB_OUTPUT"
@@ -184,7 +189,8 @@ jobs:
         NGINX_COMMIT: ${{ needs.resolve.outputs.nginx_commit }}
       run: |
         docker build -t nginx-interop --build-arg NGINX_COMMIT="$NGINX_COMMIT" .
-        docker run --rm --entrypoint /usr/sbin/nginx nginx-interop -V 2>&1 | tee nginx-V
+        docker run --rm --entrypoint /usr/sbin/nginx nginx-interop -V > nginx-V 2>&1
+        cat nginx-V
         grep -qF -- "$NGINX_COMMIT" nginx-V
         docker save nginx-interop | zstd -T0 -3 -o nginx-interop.tar.zst
 
@@ -381,6 +387,7 @@ jobs:
     - name: Generate summary
       env:
         OPENSSL_LTS_BRANCH: ${{ needs.resolve.outputs.openssl_lts_branch }}
+        NGINX_LABEL: ${{ needs.resolve.outputs.nginx_label }}
         NGINX_URL: ${{ needs.resolve.outputs.nginx_url }}
         NGINX_DIGEST: ${{ needs.resolve.outputs.nginx_digest }}
         MATRIX: ${{ needs.resolve.outputs.matrix }}

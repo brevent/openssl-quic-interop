@@ -74,7 +74,7 @@ def links():
             urls[entry["label"]] = (entry["url"], entry.get("digest", ""))
     url = os.environ.get("NGINX_URL")
     if url:
-        urls["nginx"] = (url, os.environ.get("NGINX_DIGEST", ""))
+        urls[nginx] = (url, os.environ.get("NGINX_DIGEST", ""))
     return urls
 
 
@@ -104,6 +104,7 @@ def link(name):
     return f"{text} ({digest})" if digest else text
 
 
+nginx = os.environ.get("NGINX_LABEL") or "nginx"
 urls = links()
 run_url = run_page()
 names = {}
@@ -134,7 +135,7 @@ number = os.environ.get("GITHUB_RUN_NUMBER")
 if number and run_url:
     print(f"Run: [#{number}]({run_url})")
     print()
-print(f"server: {link('nginx')}")
+print(f"server: {link(nginx)}")
 print()
 print("clients:")
 for c, _, _ in clients:
