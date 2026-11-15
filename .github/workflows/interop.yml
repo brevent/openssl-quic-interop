@@ -259,6 +259,7 @@ jobs:
         exit 1
 
     - name: Patch implementations file
+      if: ${{ startsWith(matrix.client, 'openssl-') }}
       run: |
         jq '. + {
               "openssl-lts": {image: "openssl-lts-interop", url: "https://github.com/openssl/openssl", role: "client"},
@@ -349,7 +350,7 @@ jobs:
         fi
 
     - name: Keep only failed logs
-      if: ${{ steps.run.outputs.failed == 'true' }}
+      if: ${{ steps.run.outputs.failed == 'true' && needs.resolve.outputs.nginx_commit == '' }}
       run: |
         jq -r '(.results[][], .measurements[][]) | select(.result == "succeeded") | .name' result.json |
         while IFS= read -r name; do
@@ -365,7 +366,7 @@ jobs:
         retention-days: 7
 
     - name: Upload logs
-      if: ${{ failure() || steps.run.outputs.failed == 'true' }}
+      if: ${{ failure() || steps.run.outputs.failed == 'true' || needs.resolve.outputs.nginx_commit != '' }}
       uses: actions/upload-artifact@v7
       with:
         name: logs-${{ matrix.label }}
