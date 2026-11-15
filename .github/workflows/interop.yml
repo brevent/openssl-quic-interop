@@ -17,7 +17,7 @@ on:
       tests:
         description: "Tests, comma separated, default all"
         default: ""
-      nginx_commit:
+      nginx-commit:
         description: "Build nginx with commit (or branch, tag, pull/ID), default prebuilt master"
         default: ""
 
@@ -25,8 +25,9 @@ permissions: {}
 
 env:
   CLIENTS: ${{ github.event_name != 'workflow_dispatch' && 'openssl-lts,openssl-master,ngtcp2' || inputs.clients }}
-  TESTS: ${{ inputs.tests }}
-  NGINX_COMMIT: ${{ inputs.nginx_commit }}
+  TESTS: ${{ github.event_name == 'push' && 'H,3' || inputs.tests }}
+  NGINX_COMMIT: ${{ inputs.nginx-commit }}
+  WIRESHARK_VERSION: "4.6.9"
 
 jobs:
   resolve:
@@ -209,8 +210,46 @@ jobs:
         path: nginx-interop.tar.zst
         retention-days: 1
 
+  tshark:
+    runs-on: ubuntu-26.04
+    permissions:
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Check tshark image
+      id: image
+      run: |
+        hash=$(cat .github/wireshark/* | sha256sum | cut -c1-12)
+        image=ghcr.io/$GITHUB_REPOSITORY_OWNER/wireshark:$WIRESHARK_VERSION-$hash
+        echo "image=$image" >> "$GITHUB_OUTPUT"
+        if ! docker buildx imagetools inspect "$image" > /dev/null 2>&1; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - uses: docker/login-action@v4
+      if: ${{ steps.image.outputs.build }}
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+
+    - uses: docker/build-push-action@v7
+      if: ${{ steps.image.outputs.build }}
+      with:
+        context: .github/wireshark
+        build-args: WIRESHARK_VERSION=${{ env.WIRESHARK_VERSION }}
+        labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+        tags: ${{ steps.image.outputs.image }}
+        push: true
+
   interop:
-    needs: [ resolve, nginx ]
+    needs: [ resolve, nginx, tshark ]
     name: interop (${{ matrix.label }})
     strategy:
       fail-fast: false
@@ -249,10 +288,19 @@ jobs:
 
     - name: Install tshark
       timeout-minutes: 5
+      env:
+        DEBIAN_FRONTEND: noninteractive
+        IMAGE: ${{ needs.tshark.outputs.image }}
       run: |
+        id=$(docker create "$IMAGE" -)
+        sudo docker cp "$id:/debs" /opt/
+        docker rm "$id"
+        echo "deb [trusted=yes arch=$(dpkg --print-architecture)] file:/opt/debs ./" |
+            sudo tee /etc/apt/sources.list.d/wireshark.list
         for _ in 1 2 3; do
             sudo timeout 60 apt-get update &&
                 sudo timeout 60 apt-get install -y --no-install-recommends tshark &&
+                tshark -v | head -1 &&
                 exit 0
             sleep 5
         done

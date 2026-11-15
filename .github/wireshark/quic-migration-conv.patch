@@ -1,0 +1,15 @@
+--- a/epan/dissectors/packet-quic.c
++++ b/epan/dissectors/packet-quic.c
+@@ -1325,7 +1325,11 @@
+             // No match found, truncate DCID (not really needed, but this
+             // ensures that debug prints clearly show that DCID is invalid).
+             dcid->len = 0;
+-        } else if (quic_connection_from_conv(pinfo) == NULL) {
++        }
++    }
++
++    if (!is_long_packet && conn) {
++        if (quic_connection_from_conv(pinfo) == NULL) {
+             // Connection information might not be attached to the 5-tuple
+             // conversation, because of connection migration.
+             conversation_t *conv = find_conversation(pinfo->num, &pinfo->src, &pinfo->dst, conversation_pt_to_conversation_type(pinfo->ptype), pinfo->srcport, pinfo->destport, 0);
