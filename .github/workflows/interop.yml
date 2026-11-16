@@ -1,5 +1,5 @@
 name: QUIC interop
-run-name: ${{ inputs.run-name }}
+run-name: "${{ github.event_name == 'schedule' && format('{0} #{1} (daily)', github.workflow, github.run_number) || inputs.run-name }}"
 
 on:
   push:
@@ -20,6 +20,10 @@ on:
       nginx-commit:
         description: "Build nginx with commit (or branch, tag, pull/ID), default prebuilt master"
         default: ""
+      keep-logs:
+        description: "Keep logs of all tests, default only failed"
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -397,8 +401,8 @@ jobs:
             echo "failed=true" >> "$GITHUB_OUTPUT"
         fi
 
-    - name: Keep only failed logs
-      if: ${{ steps.run.outputs.failed == 'true' && needs.resolve.outputs.nginx_commit == '' }}
+    - name: Prune logs of passed tests
+      if: ${{ steps.run.outputs.failed == 'true' && !inputs.keep-logs }}
       run: |
         jq -r '(.results[][], .measurements[][]) | select(.result == "succeeded") | .name' result.json |
         while IFS= read -r name; do
@@ -414,7 +418,7 @@ jobs:
         retention-days: 7
 
     - name: Upload logs
-      if: ${{ failure() || steps.run.outputs.failed == 'true' || needs.resolve.outputs.nginx_commit != '' }}
+      if: ${{ failure() || steps.run.outputs.failed == 'true' || inputs.keep-logs }}
       uses: actions/upload-artifact@v7
       with:
         name: logs-${{ matrix.label }}
