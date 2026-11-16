@@ -334,6 +334,13 @@ jobs:
         docker version
         docker compose version
 
+    - uses: actions/checkout@v7
+      if: ${{ startsWith(matrix.client, 'openssl-') }}
+      with:
+        path: self
+        sparse-checkout: .github/patches
+        persist-credentials: false
+
     - name: Prepare ${{ matrix.label }}
       env:
         IMAGE: ${{ matrix.image }}
@@ -346,15 +353,19 @@ jobs:
             exit
         fi
         dir=openssl-src/test/quic-openssl-docker
-        old='git clone --depth 1 -b \$OPENSSL_BRANCH \$OPENSSL_URL'
-        new='git init openssl \&\& git -C openssl fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH \&\& git -C openssl checkout FETCH_HEAD'
+        cat self/.github/patches/quic-hq-interop-*.patch 2> /dev/null |
+            git -C openssl-src apply --allow-empty --stat --apply
+        old='RUN git clone --depth 1 -b \$OPENSSL_BRANCH \$OPENSSL_URL'
+        new='RUN --mount=type=bind,from=patches,target=/openssl-patches git init openssl \&\& git -C openssl fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH \&\& git -C openssl checkout FETCH_HEAD \&\& cat /openssl-patches/*.patch 2> /dev/null \| git -C openssl apply --allow-empty --stat --apply'
         sed -i "s|$old|$new|" "$dir/Dockerfile"
         grep -qF -- 'fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH' "$dir/Dockerfile"
+
         if [ -n "$CURL_BRANCH" ]; then
             sed -i "s|clone --depth 1 https://github.com/curl/|clone --depth 1 -b $CURL_BRANCH https://github.com/curl/|" "$dir/Dockerfile"
             grep -qF -- "-b $CURL_BRANCH " "$dir/Dockerfile"
         fi
-        docker build -t "${{ matrix.client }}-interop" --build-arg OPENSSL_BRANCH="$COMMIT" "$dir"
+        docker build -t "${{ matrix.client }}-interop" --build-arg OPENSSL_BRANCH="$COMMIT" \
+            --build-context patches=self/.github/patches "$dir"
 
     - uses: actions/download-artifact@v7
       if: ${{ needs.resolve.outputs.nginx_commit != '' }}
