@@ -17,9 +17,9 @@ on:
       tests:
         description: "Tests, comma separated, default all"
         default: ""
-      nginx-commit:
-        description: "Build nginx with commit (or branch, tag, pull/ID), default prebuilt master"
-        default: ""
+      server:
+        description: "Server: brevent (prebuilt), a server of the runner (nginx, haproxy, ...), or nginx commit (or branch, tag, pull/ID) to build"
+        default: "brevent"
       rounds:
         description: "Rounds to run each client"
         type: choice
@@ -35,7 +35,7 @@ permissions: {}
 env:
   CLIENTS: ${{ github.event_name != 'workflow_dispatch' && 'openssl-lts,openssl-master,ngtcp2' || inputs.clients }}
   TESTS: ${{ github.event_name == 'push' && 'H,3' || inputs.tests }}
-  NGINX_COMMIT: ${{ inputs.nginx-commit }}
+  SERVER: ${{ inputs.server || 'brevent' }}
   WIRESHARK_VERSION: "4.6.9"
 
 jobs:
@@ -47,11 +47,12 @@ jobs:
       openssl_lts_branch: ${{ steps.openssl.outputs.openssl_lts_branch }}
       builds: ${{ steps.images.outputs.builds }}
       matrix: ${{ steps.images.outputs.matrix }}
-      nginx_image: ${{ steps.images.outputs.nginx_image }}
-      nginx_label: ${{ steps.images.outputs.nginx_label }}
-      nginx_url: ${{ steps.images.outputs.nginx_url }}
+      server: ${{ steps.images.outputs.server }}
+      server_image: ${{ steps.images.outputs.server_image }}
+      server_label: ${{ steps.images.outputs.server_label }}
+      server_url: ${{ steps.images.outputs.server_url }}
+      server_digest: ${{ steps.images.outputs.server_digest }}
       nginx_commit: ${{ steps.images.outputs.nginx_commit }}
-      nginx_digest: ${{ steps.images.outputs.nginx_digest }}
 
     steps:
     - name: Resolve openssl commits
@@ -68,7 +69,7 @@ jobs:
         resolve_commit openssl_lts "$lts"
         resolve_commit openssl_master master
 
-    - name: Resolve clients and nginx
+    - name: Resolve clients and server
       id: images
       env:
         GH_TOKEN: ${{ github.token }}
@@ -78,10 +79,10 @@ jobs:
         ROUNDS: ${{ inputs.rounds }}
       run: |
         impl=$(curl -fsSL https://raw.githubusercontent.com/quic-interop/quic-interop-runner/master/implementations_quic.json)
-        resolve_client() {
-            client=$1
-            image=$(jq -er --arg c "$client" '.[$c] | select(.role == "client" or .role == "both") | .image' <<< "$impl") || {
-                echo "::error::unknown client: $client"
+        resolve_impl() {
+            client=$1 role=$2
+            image=$(jq -er --arg c "$client" --arg r "$role" '.[$c] | select(.role == $r or .role == "both") | .image' <<< "$impl") || {
+                echo "::error::unknown $role: $client"
                 exit 1
             }
             digest=$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')
@@ -112,7 +113,11 @@ jobs:
                 fi
                 ;;
             esac
-            entry=$(jq -nc --arg c "$client" --arg image "$image@$digest" --arg url "$url" --arg digest "$digest" \
+            image=$image@$digest
+        }
+        resolve_client() {
+            resolve_impl "$1" client
+            entry=$(jq -nc --arg c "$1" --arg image "$image" --arg url "$url" --arg digest "$digest" \
                 '{client: $c, label: $c, image: $image, url: $url, digest: $digest}')
         }
         if [ -z "$CLIENTS" ]; then
@@ -143,72 +148,80 @@ jobs:
             exit 1
         fi
         echo "builds=$(jq -c 'map(select(.commit))' <<< "$matrix")" >> "$GITHUB_OUTPUT"
+        server_entry=$(jq -c --arg s "$SERVER" '.[] | select(.client == $s)' <<< "$matrix")
         if [ "${ROUNDS:-1}" -gt 1 ]; then
             matrix=$(jq -c --argjson n "$ROUNDS" '[.[] as $e | range(1; $n + 1) | $e + {label: "\($e.label)-\(.)", name: $e.label}]' <<< "$matrix")
         fi
         echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
-        resolve_image() {
-            name=$1 repo=$2 package=$3
-            org=${repo%%/*}
-            image=ghcr.io/$org/$package
+        label=$SERVER image= url= digest= commit=
+        if [ "$SERVER" = brevent ]; then
+            repo=brevent/nginx-quic-qns package=nginx-quic-qns
+            image=ghcr.io/${repo%%/*}/$package
             digest=$(docker buildx imagetools inspect "$image:latest" --format '{{.Manifest.Digest}}')
-            id=$(gh api "/orgs/$org/packages/container/$package/versions" \
+            id=$(gh api "/orgs/${repo%%/*}/packages/container/$package/versions" \
                 --jq ".[] | select(.name == \"$digest\") | .id") || true
-            echo "${name}_image=$image@$digest" >> "$GITHUB_OUTPUT"
-            echo "${name}_url=https://github.com/$repo/pkgs/container/$package/${id:-versions}" >> "$GITHUB_OUTPUT"
-            echo "${name}_digest=$digest" >> "$GITHUB_OUTPUT"
-        }
-
-        if [ -z "$NGINX_COMMIT" ]; then
-            resolve_image nginx brevent/nginx-quic-qns nginx-quic-qns
+            image=$image@$digest
+            url=https://github.com/$repo/pkgs/container/$package/${id:-versions}
+        elif [ "$SERVER" = openssl-lts ] || [ "$SERVER" = openssl-master ]; then
+            if [ -z "$server_entry" ]; then
+                echo "::error::server $SERVER needs client $SERVER"
+                exit 1
+            fi
+            label=$(jq -r .label <<< "$server_entry")
+            url=$(jq -r .url <<< "$server_entry")
+            digest=$(jq -r .digest <<< "$server_entry")
+        elif jq -e --arg s "$SERVER" '.[$s] | select(.role == "server" or .role == "both")' <<< "$impl" > /dev/null; then
+            resolve_impl "$SERVER" server
         else
-            ref=$NGINX_COMMIT
+            ref=$SERVER
             if [[ $ref == pull/* ]]; then ref=$ref/head; fi
             git init -q nginx
             git -C nginx fetch -q --depth=1 https://github.com/nginx/nginx "$ref" || {
-                echo "::error::cannot fetch $ref from nginx/nginx"
+                echo "::error::unknown server, and no such ref in nginx/nginx: $SERVER"
                 exit 1
             }
             commit=$(git -C nginx rev-parse FETCH_HEAD^{commit})
-            case $NGINX_COMMIT in
+            case $SERVER in
             pull/*)
-                label=nginx/nginx#${NGINX_COMMIT#pull/}
-                url=https://github.com/nginx/nginx/$NGINX_COMMIT
+                label=nginx/nginx#${SERVER#pull/}
+                url=https://github.com/nginx/nginx/$SERVER
                 digest=${commit:0:12}
                 ;;
             "$commit")
                 label=nginx/nginx@${commit:0:12}
                 url=https://github.com/nginx/nginx/commit/$commit
-                digest=
                 ;;
             *)
-                label=nginx/nginx@$NGINX_COMMIT
+                label=nginx/nginx@$SERVER
                 url=https://github.com/nginx/nginx/commit/$commit
                 digest=${commit:0:12}
                 ;;
             esac
-            {
-                echo "nginx_commit=$commit"
-                echo "nginx_label=$label"
-                echo "nginx_url=$url"
-                echo "nginx_digest=$digest"
-            } >> "$GITHUB_OUTPUT"
+            SERVER=nginx
         fi
+        {
+            echo "server=$SERVER"
+            echo "server_image=$image"
+            echo "server_label=$label"
+            echo "server_url=$url"
+            echo "server_digest=$digest"
+            echo "nginx_commit=$commit"
+        } >> "$GITHUB_OUTPUT"
 
   nginx:
     needs: resolve
+    if: ${{ needs.resolve.outputs.nginx_commit != '' }}
+    name: build (nginx)
     runs-on: ubuntu-26.04
 
     steps:
     - uses: actions/checkout@v7
-      if: ${{ needs.resolve.outputs.nginx_commit != '' }}
       with:
         repository: brevent/nginx-quic-qns
         persist-credentials: false
 
     - name: Build nginx
-      if: ${{ needs.resolve.outputs.nginx_commit != '' }}
       env:
         NGINX_COMMIT: ${{ needs.resolve.outputs.nginx_commit }}
       run: |
@@ -219,7 +232,6 @@ jobs:
         docker save nginx-interop | zstd -T0 -3 -o nginx-interop.tar.zst
 
     - uses: actions/upload-artifact@v7
-      if: ${{ needs.resolve.outputs.nginx_commit != '' }}
       with:
         name: nginx-image
         path: nginx-interop.tar.zst
@@ -363,7 +375,8 @@ jobs:
             sudo tee /etc/apt/sources.list.d/wireshark.list
         for _ in 1 2 3; do
             sudo timeout 60 apt-get update &&
-                sudo timeout 60 apt-get install -y --no-install-recommends tshark &&
+                sudo timeout 60 apt-get install -y --download-only --no-install-recommends tshark &&
+                sudo apt-get install -y --no-install-recommends tshark &&
                 tshark -v | head -1 &&
                 exit 0
             sleep 5
@@ -371,11 +384,11 @@ jobs:
         exit 1
 
     - name: Patch implementations file
-      if: ${{ startsWith(matrix.client, 'openssl-') }}
       run: |
         jq '. + {
-              "openssl-lts": {image: "openssl-lts-interop", url: "https://github.com/openssl/openssl", role: "client"},
-              "openssl-master": {image: "openssl-master-interop", url: "https://github.com/openssl/openssl", role: "client"}
+              "openssl-lts": {image: "openssl-lts-interop", url: "https://github.com/openssl/openssl", role: "both"},
+              "openssl-master": {image: "openssl-master-interop", url: "https://github.com/openssl/openssl", role: "both"},
+              "brevent": {image: "server-interop", url: "https://github.com/brevent/nginx-quic-qns", role: "server"}
             }' implementations_quic.json > implementations.tmp
         mv implementations.tmp implementations_quic.json
 
@@ -415,21 +428,36 @@ jobs:
       with:
         name: nginx-image
 
-    - name: Prepare nginx
+    - uses: actions/download-artifact@v7
+      if: ${{ startsWith(needs.resolve.outputs.server, 'openssl-') && needs.resolve.outputs.server != matrix.client }}
+      with:
+        name: ${{ needs.resolve.outputs.server }}-image
+
+    - name: Prepare ${{ needs.resolve.outputs.server_label }}
       env:
-        NGINX_IMAGE: ${{ needs.resolve.outputs.nginx_image }}
+        CLIENT: ${{ matrix.client }}
+        SERVER: ${{ needs.resolve.outputs.server }}
+        SERVER_IMAGE: ${{ needs.resolve.outputs.server_image }}
       run: |
-        if [ -z "$NGINX_IMAGE" ]; then
+        if [ "$SERVER" = "$CLIENT" ]; then
+            echo "same image as the client"
+        elif [[ $SERVER == openssl-* ]]; then
+            zstd -dc "$SERVER-interop.tar.zst" | docker load
+            docker tag "$SERVER-interop" server-interop
+        elif [ -z "$SERVER_IMAGE" ]; then
             zstd -dc nginx-interop.tar.zst | docker load
-            exit
+            docker tag nginx-interop server-interop
+        else
+            docker pull "$SERVER_IMAGE"
+            docker tag "$SERVER_IMAGE" server-interop
         fi
-        docker pull "$NGINX_IMAGE"
-        docker tag "$NGINX_IMAGE" nginx-interop
 
     - name: Run tests
       id: run
       env:
         LABEL: ${{ matrix.label }}
+        CLIENT: ${{ matrix.client }}
+        SERVER: ${{ needs.resolve.outputs.server }}
       run: |
         if [ -n "$TESTS" ]; then
             TESTS=$(python3 -c '
@@ -439,7 +467,9 @@ jobs:
         print(",".join(names[t.strip()] for t in sys.argv[1].split(",")))
         ' "$TESTS")
         fi
-        python3 run.py -c ${{ matrix.client }} -s nginx -r nginx=nginx-interop,${{ matrix.client }}=${{ matrix.client }}-interop ${TESTS:+-t "$TESTS"} -d --log-dir logs -j result.json || true
+        replace=$CLIENT=$CLIENT-interop
+        if [ "$SERVER" != "$CLIENT" ]; then replace=$SERVER=server-interop,$replace; fi
+        python3 run.py -c "$CLIENT" -s "$SERVER" -r "$replace" ${TESTS:+-t "$TESTS"} -d --log-dir logs -j result.json || true
         if [ ! -f result.json ]; then
             echo "::error title=$LABEL::no result"
             exit 1
@@ -457,10 +487,12 @@ jobs:
 
     - name: Prune logs of passed tests
       if: ${{ steps.run.outputs.failed == 'true' && !inputs.keep-logs }}
+      env:
+        SERVER: ${{ needs.resolve.outputs.server }}
       run: |
         jq -r '(.results[][], .measurements[][]) | select(.result == "succeeded") | .name' result.json |
         while IFS= read -r name; do
-            rm -rfv -- "logs/nginx_${{ matrix.client }}/$name"
+            rm -rfv -- "logs/${SERVER}_${{ matrix.client }}/$name"
         done
 
     - name: Upload result
@@ -502,9 +534,9 @@ jobs:
     - name: Generate summary
       env:
         OPENSSL_LTS_BRANCH: ${{ needs.resolve.outputs.openssl_lts_branch }}
-        NGINX_LABEL: ${{ needs.resolve.outputs.nginx_label }}
-        NGINX_URL: ${{ needs.resolve.outputs.nginx_url }}
-        NGINX_DIGEST: ${{ needs.resolve.outputs.nginx_digest }}
+        SERVER_LABEL: ${{ needs.resolve.outputs.server_label }}
+        SERVER_URL: ${{ needs.resolve.outputs.server_url }}
+        SERVER_DIGEST: ${{ needs.resolve.outputs.server_digest }}
         MATRIX: ${{ needs.resolve.outputs.matrix }}
       run: |
         if [ -n "$MATRIX" ]; then

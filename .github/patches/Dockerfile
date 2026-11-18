@@ -1,5 +1,3 @@
-# Keep only what the client runs, and the libraries they need, of the image
-# built by OpenSSL's test/quic-openssl-docker.
 ARG BUILDER
 FROM ${BUILDER} AS builder
 RUN bins="/usr/local/bin/* $(command -v curl || true)" && mkdir /out && \

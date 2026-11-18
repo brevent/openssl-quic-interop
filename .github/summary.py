@@ -73,9 +73,9 @@ def links():
         if isinstance(entry, dict) and entry.get("label") and entry.get("url"):
             urls[entry["label"]] = (entry["url"], entry.get("digest", ""),
                                     entry.get("name", entry["label"]))
-    url = os.environ.get("NGINX_URL")
+    url = os.environ.get("SERVER_URL")
     if url:
-        urls[nginx] = (url, os.environ.get("NGINX_DIGEST", ""), nginx)
+        urls[server_name] = (url, os.environ.get("SERVER_DIGEST", ""), server_name)
     return urls
 
 
@@ -105,7 +105,7 @@ def link(name):
     return f"{text} ({digest})" if digest else text
 
 
-nginx = os.environ.get("NGINX_LABEL") or "nginx"
+server_name = os.environ.get("SERVER_LABEL") or "brevent"
 urls = links()
 run_url = run_page()
 names = {}
@@ -136,7 +136,7 @@ number = os.environ.get("GITHUB_RUN_NUMBER")
 if number and run_url:
     print(f"Run: [#{number}]({run_url})")
     print()
-print(f"server: {link(nginx)}")
+print(f"server: {link(server_name)}")
 print()
 print("clients:")
 # Rounds of a client share a link
