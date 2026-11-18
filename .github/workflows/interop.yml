@@ -20,6 +20,11 @@ on:
       nginx-commit:
         description: "Build nginx with commit (or branch, tag, pull/ID), default prebuilt master"
         default: ""
+      rounds:
+        description: "Rounds to run each client"
+        type: choice
+        options: [ "1", "2", "3", "4", "5", "6", "7", "8" ]
+        default: "1"
       keep-logs:
         description: "Keep logs of all tests, default only failed"
         type: boolean
@@ -40,6 +45,7 @@ jobs:
       packages: read
     outputs:
       openssl_lts_branch: ${{ steps.openssl.outputs.openssl_lts_branch }}
+      builds: ${{ steps.images.outputs.builds }}
       matrix: ${{ steps.images.outputs.matrix }}
       nginx_image: ${{ steps.images.outputs.nginx_image }}
       nginx_label: ${{ steps.images.outputs.nginx_label }}
@@ -69,6 +75,7 @@ jobs:
         LTS_BRANCH: ${{ steps.openssl.outputs.openssl_lts_branch }}
         LTS_COMMIT: ${{ steps.openssl.outputs.openssl_lts }}
         MASTER_COMMIT: ${{ steps.openssl.outputs.openssl_master }}
+        ROUNDS: ${{ inputs.rounds }}
       run: |
         impl=$(curl -fsSL https://raw.githubusercontent.com/quic-interop/quic-interop-runner/master/implementations_quic.json)
         resolve_client() {
@@ -134,6 +141,10 @@ jobs:
         if [ "$matrix" = '[]' ]; then
             echo "::error::no clients selected"
             exit 1
+        fi
+        echo "builds=$(jq -c 'map(select(.commit))' <<< "$matrix")" >> "$GITHUB_OUTPUT"
+        if [ "${ROUNDS:-1}" -gt 1 ]; then
+            matrix=$(jq -c --argjson n "$ROUNDS" '[.[] as $e | range(1; $n + 1) | $e + {label: "\($e.label)-\(.)", name: $e.label}]' <<< "$matrix")
         fi
         echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
@@ -215,6 +226,7 @@ jobs:
         retention-days: 1
 
   tshark:
+    needs: resolve
     runs-on: ubuntu-26.04
     permissions:
       packages: write
@@ -252,8 +264,65 @@ jobs:
         tags: ${{ steps.image.outputs.image }}
         push: true
 
+  openssl:
+    needs: resolve
+    if: ${{ needs.resolve.outputs.builds != '[]' }}
+    name: build (${{ matrix.label }})
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.builds) }}
+    runs-on: ubuntu-26.04
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        repository: openssl/openssl
+        ref: ${{ matrix.commit }}
+        path: openssl-src
+        sparse-checkout: test/quic-openssl-docker
+        persist-credentials: false
+
+    - uses: actions/checkout@v7
+      with:
+        path: self
+        sparse-checkout: .github/patches
+        persist-credentials: false
+
+    - name: Build ${{ matrix.label }}
+      env:
+        COMMIT: ${{ matrix.commit }}
+        CURL_BRANCH: ${{ matrix.curl_branch }}
+      run: |
+        dir=openssl-src/test/quic-openssl-docker
+        cat self/.github/patches/quic-hq-interop-*.patch 2> /dev/null |
+            git -C openssl-src apply --allow-empty --stat --apply
+        old='RUN git clone --depth 1 -b \$OPENSSL_BRANCH \$OPENSSL_URL'
+        new='RUN --mount=type=bind,from=patches,target=/openssl-patches git init openssl \&\& git -C openssl fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH \&\& git -C openssl checkout FETCH_HEAD \&\& cat /openssl-patches/*.patch 2> /dev/null \| git -C openssl apply --allow-empty --stat --apply'
+        sed -i "s|$old|$new|" "$dir/Dockerfile"
+        grep -qF -- 'fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH' "$dir/Dockerfile"
+
+        if [ -n "$CURL_BRANCH" ]; then
+            sed -i "s|clone --depth 1 https://github.com/curl/|clone --depth 1 -b $CURL_BRANCH https://github.com/curl/|" "$dir/Dockerfile"
+            grep -qF -- "-b $CURL_BRANCH " "$dir/Dockerfile"
+        fi
+        docker build -t "${{ matrix.client }}-builder" --build-arg OPENSSL_BRANCH="$COMMIT" \
+            --build-context patches=self/.github/patches "$dir"
+        docker build -t "${{ matrix.client }}-interop" --build-arg BUILDER="${{ matrix.client }}-builder" self/.github/patches
+        if docker run --rm --entrypoint sh "${{ matrix.client }}-interop" -c \
+            'for f in /usr/local/bin/* $(command -v curl); do ldd "$f"; done' | grep 'not found'; then
+            exit 1
+        fi
+        docker save "${{ matrix.client }}-interop" | zstd -T0 -3 -o "${{ matrix.client }}-interop.tar.zst"
+
+    - uses: actions/upload-artifact@v7
+      with:
+        name: ${{ matrix.client }}-image
+        path: ${{ matrix.client }}-interop.tar.zst
+        retention-days: 1
+
   interop:
-    needs: [ resolve, nginx, tshark ]
+    needs: [ resolve, nginx, tshark, openssl ]
+    if: ${{ !failure() && !cancelled() }}
     name: interop (${{ matrix.label }})
     strategy:
       fail-fast: false
@@ -266,15 +335,6 @@ jobs:
       with:
         repository: quic-interop/quic-interop-runner
         fetch-depth: 0
-        persist-credentials: false
-
-    - uses: actions/checkout@v7
-      if: ${{ startsWith(matrix.client, 'openssl-') }}
-      with:
-        repository: openssl/openssl
-        ref: ${{ matrix.commit }}
-        path: openssl-src
-        sparse-checkout: test/quic-openssl-docker
         persist-credentials: false
 
     - uses: actions/setup-python@v6
@@ -334,38 +394,21 @@ jobs:
         docker version
         docker compose version
 
-    - uses: actions/checkout@v7
-      if: ${{ startsWith(matrix.client, 'openssl-') }}
+    - uses: actions/download-artifact@v7
+      if: ${{ matrix.commit }}
       with:
-        path: self
-        sparse-checkout: .github/patches
-        persist-credentials: false
+        name: ${{ matrix.client }}-image
 
     - name: Prepare ${{ matrix.label }}
       env:
         IMAGE: ${{ matrix.image }}
-        COMMIT: ${{ matrix.commit }}
-        CURL_BRANCH: ${{ matrix.curl_branch }}
       run: |
         if [ -n "$IMAGE" ]; then
             docker pull "$IMAGE"
             docker tag "$IMAGE" "${{ matrix.client }}-interop"
             exit
         fi
-        dir=openssl-src/test/quic-openssl-docker
-        cat self/.github/patches/quic-hq-interop-*.patch 2> /dev/null |
-            git -C openssl-src apply --allow-empty --stat --apply
-        old='RUN git clone --depth 1 -b \$OPENSSL_BRANCH \$OPENSSL_URL'
-        new='RUN --mount=type=bind,from=patches,target=/openssl-patches git init openssl \&\& git -C openssl fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH \&\& git -C openssl checkout FETCH_HEAD \&\& cat /openssl-patches/*.patch 2> /dev/null \| git -C openssl apply --allow-empty --stat --apply'
-        sed -i "s|$old|$new|" "$dir/Dockerfile"
-        grep -qF -- 'fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH' "$dir/Dockerfile"
-
-        if [ -n "$CURL_BRANCH" ]; then
-            sed -i "s|clone --depth 1 https://github.com/curl/|clone --depth 1 -b $CURL_BRANCH https://github.com/curl/|" "$dir/Dockerfile"
-            grep -qF -- "-b $CURL_BRANCH " "$dir/Dockerfile"
-        fi
-        docker build -t "${{ matrix.client }}-interop" --build-arg OPENSSL_BRANCH="$COMMIT" \
-            --build-context patches=self/.github/patches "$dir"
+        zstd -dc "${{ matrix.client }}-interop.tar.zst" | docker load
 
     - uses: actions/download-artifact@v7
       if: ${{ needs.resolve.outputs.nginx_commit != '' }}

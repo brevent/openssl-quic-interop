@@ -71,10 +71,11 @@ def links():
         matrix = []
     for entry in matrix if isinstance(matrix, list) else ():
         if isinstance(entry, dict) and entry.get("label") and entry.get("url"):
-            urls[entry["label"]] = (entry["url"], entry.get("digest", ""))
+            urls[entry["label"]] = (entry["url"], entry.get("digest", ""),
+                                    entry.get("name", entry["label"]))
     url = os.environ.get("NGINX_URL")
     if url:
-        urls[nginx] = (url, os.environ.get("NGINX_DIGEST", ""))
+        urls[nginx] = (url, os.environ.get("NGINX_DIGEST", ""), nginx)
     return urls
 
 
@@ -99,8 +100,8 @@ def blank(tests, measurements):
 def link(name):
     if name not in urls:
         return name
-    url, digest = urls[name]
-    text = f"[{name}]({url})"
+    url, digest, text = urls[name]
+    text = f"[{text}]({url})"
     return f"{text} ({digest})" if digest else text
 
 
@@ -138,8 +139,9 @@ if number and run_url:
 print(f"server: {link(nginx)}")
 print()
 print("clients:")
-for c, _, _ in clients:
-    print(f"- {link(c)}")
+# Rounds of a client share a link
+for text in dict.fromkeys(link(c) for c, _, _ in clients):
+    print(f"- {text}")
 print()
 print(row(["test"] + [escape(c) for c, _, _ in clients]))
 print("|---|" + ":--:|" * len(clients))
