@@ -147,7 +147,7 @@ jobs:
             echo "::error::no clients selected"
             exit 1
         fi
-        echo "builds=$(jq -c 'map(select(.commit))' <<< "$matrix")" >> "$GITHUB_OUTPUT"
+        echo "builds=$(jq -c 'map(select(.commit)) | if . == [] then [{label: "none"}] else . end' <<< "$matrix")" >> "$GITHUB_OUTPUT"
         server_entry=$(jq -c --arg s "$SERVER" '.[] | select(.client == $s)' <<< "$matrix")
         if [ "${ROUNDS:-1}" -gt 1 ]; then
             matrix=$(jq -c --argjson n "$ROUNDS" '[.[] as $e | range(1; $n + 1) | $e + {label: "\($e.label)-\(.)", name: $e.label}]' <<< "$matrix")
@@ -272,13 +272,18 @@ jobs:
       with:
         context: .github/wireshark
         build-args: WIRESHARK_VERSION=${{ env.WIRESHARK_VERSION }}
-        labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+        labels: |
+          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
+          org.opencontainers.image.description=wireshark ${{ env.WIRESHARK_VERSION }} debs built from ${{ github.repository }}@${{ github.sha }}
+        annotations: |
+          index,manifest:org.opencontainers.image.revision=${{ github.sha }}
+          index,manifest:org.opencontainers.image.description=wireshark ${{ env.WIRESHARK_VERSION }} debs built from ${{ github.repository }}@${{ github.sha }}
         tags: ${{ steps.image.outputs.image }}
         push: true
 
   openssl:
     needs: resolve
-    if: ${{ needs.resolve.outputs.builds != '[]' }}
     name: build (${{ matrix.label }})
     strategy:
       matrix:
@@ -287,6 +292,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v7
+      if: ${{ matrix.commit }}
       with:
         repository: openssl/openssl
         ref: ${{ matrix.commit }}
@@ -295,12 +301,14 @@ jobs:
         persist-credentials: false
 
     - uses: actions/checkout@v7
+      if: ${{ matrix.commit }}
       with:
         path: self
         sparse-checkout: .github/patches
         persist-credentials: false
 
     - name: Build ${{ matrix.label }}
+      if: ${{ matrix.commit }}
       env:
         COMMIT: ${{ matrix.commit }}
         CURL_BRANCH: ${{ matrix.curl_branch }}
@@ -327,6 +335,7 @@ jobs:
         docker save "${{ matrix.client }}-interop" | zstd -T0 -3 -o "${{ matrix.client }}-interop.tar.zst"
 
     - uses: actions/upload-artifact@v7
+      if: ${{ matrix.commit }}
       with:
         name: ${{ matrix.client }}-image
         path: ${{ matrix.client }}-interop.tar.zst
@@ -373,15 +382,11 @@ jobs:
         docker rm "$id"
         echo "deb [trusted=yes arch=$(dpkg --print-architecture)] file:/opt/debs ./" |
             sudo tee /etc/apt/sources.list.d/wireshark.list
-        for _ in 1 2 3; do
-            sudo timeout 60 apt-get update &&
-                sudo timeout 60 apt-get install -y --download-only --no-install-recommends tshark &&
-                sudo apt-get install -y --no-install-recommends tshark &&
-                tshark -v | head -1 &&
-                exit 0
-            sleep 5
-        done
-        exit 1
+        sudo mkdir -p /opt/debs-lists/partial
+        offline="-o Dir::Etc::SourceList=/etc/apt/sources.list.d/wireshark.list -o Dir::Etc::SourceParts=- -o Dir::State::Lists=/opt/debs-lists -o Acquire::Languages=none"
+        sudo apt-get $offline update
+        sudo apt-get $offline install -y --no-install-recommends tshark
+        tshark -v | head -1
 
     - name: Patch implementations file
       run: |
