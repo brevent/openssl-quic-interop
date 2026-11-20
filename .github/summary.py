@@ -105,7 +105,7 @@ def link(name):
     return f"{text} ({digest})" if digest else text
 
 
-server_name = os.environ.get("SERVER_LABEL") or "brevent"
+server_name = os.environ.get("SERVER_LABEL") or "nginx/nginx-quic-qns#17"
 urls = links()
 run_url = run_page()
 names = {}

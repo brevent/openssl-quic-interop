@@ -163,6 +163,7 @@ jobs:
                 --jq ".[] | select(.name == \"$digest\") | .id") || true
             image=$image@$digest
             url=https://github.com/$repo/pkgs/container/$package/${id:-versions}
+            label=nginx/nginx-quic-qns#17 SERVER=nginx
         elif [ "$SERVER" = openssl-lts ] || [ "$SERVER" = openssl-master ]; then
             if [ -z "$server_entry" ]; then
                 echo "::error::server $SERVER needs client $SERVER"
@@ -392,8 +393,7 @@ jobs:
       run: |
         jq '. + {
               "openssl-lts": {image: "openssl-lts-interop", url: "https://github.com/openssl/openssl", role: "both"},
-              "openssl-master": {image: "openssl-master-interop", url: "https://github.com/openssl/openssl", role: "both"},
-              "brevent": {image: "server-interop", url: "https://github.com/brevent/nginx-quic-qns", role: "server"}
+              "openssl-master": {image: "openssl-master-interop", url: "https://github.com/openssl/openssl", role: "both"}
             }' implementations_quic.json > implementations.tmp
         mv implementations.tmp implementations_quic.json
 
