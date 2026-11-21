@@ -33,7 +33,7 @@ on:
 permissions: {}
 
 env:
-  CLIENTS: ${{ github.event_name != 'workflow_dispatch' && 'openssl-lts,openssl-master,ngtcp2' || inputs.clients }}
+  CLIENTS: ${{ github.event_name != 'workflow_dispatch' && 'openssl-3.5,openssl-master,ngtcp2' || inputs.clients }}
   TESTS: ${{ github.event_name == 'push' && 'H,3' || inputs.tests }}
   SERVER: ${{ inputs.server || 'brevent' }}
   WIRESHARK_VERSION: "4.6.9"
@@ -44,7 +44,6 @@ jobs:
     permissions:
       packages: read
     outputs:
-      openssl_lts_branch: ${{ steps.openssl.outputs.openssl_lts_branch }}
       builds: ${{ steps.images.outputs.builds }}
       matrix: ${{ steps.images.outputs.matrix }}
       server: ${{ steps.images.outputs.server }}
@@ -55,27 +54,10 @@ jobs:
       nginx_commit: ${{ steps.images.outputs.nginx_commit }}
 
     steps:
-    - name: Resolve openssl commits
-      id: openssl
-      if: ${{ env.CLIENTS == '' || contains(env.CLIENTS, 'openssl-') }}
-      run: |
-        resolve_commit() {
-            commit=$(git ls-remote https://github.com/openssl/openssl.git "refs/heads/$2" | cut -f1)
-            [ -n "$commit" ] || exit 1
-            echo "$1=$commit" >> "$GITHUB_OUTPUT"
-        }
-        lts=openssl-3.5
-        echo "openssl_lts_branch=$lts" >> "$GITHUB_OUTPUT"
-        resolve_commit openssl_lts "$lts"
-        resolve_commit openssl_master master
-
     - name: Resolve clients and server
       id: images
       env:
         GH_TOKEN: ${{ github.token }}
-        LTS_BRANCH: ${{ steps.openssl.outputs.openssl_lts_branch }}
-        LTS_COMMIT: ${{ steps.openssl.outputs.openssl_lts }}
-        MASTER_COMMIT: ${{ steps.openssl.outputs.openssl_master }}
         ROUNDS: ${{ inputs.rounds }}
       run: |
         impl=$(curl -fsSL https://raw.githubusercontent.com/quic-interop/quic-interop-runner/master/implementations_quic.json)
@@ -120,8 +102,19 @@ jobs:
             entry=$(jq -nc --arg c "$1" --arg image "$image" --arg url "$url" --arg digest "$digest" \
                 '{client: $c, label: $c, image: $image, url: $url, digest: $digest}')
         }
+        resolve_openssl() {
+            [ "$1" = openssl-master ] && branch=master || branch=$1
+            commit=$(git ls-remote https://github.com/openssl/openssl.git "$branch" | cut -f1)
+            if [ -z "$commit" ]; then
+                echo "::error::no such branch in openssl/openssl: $branch"
+                exit 1
+            fi
+            entry=$(jq -nc --arg c "$1" --arg commit "$commit" --arg digest "${commit:0:12}" \
+                '{client: $c, label: $c, commit: $commit,
+                  url: "https://github.com/openssl/openssl/commit/\($commit)", digest: $digest}')
+        }
         if [ -z "$CLIENTS" ]; then
-            CLIENTS=openssl-lts,openssl-master,$(jq -r 'to_entries[]
+            CLIENTS=openssl-3.5,openssl-master,$(jq -r 'to_entries[]
                 | select(.value.role == "client" or .value.role == "both") | .key' <<< "$impl" | tr '\n' ,)
         fi
         matrix='[]'
@@ -129,18 +122,11 @@ jobs:
             if jq -e --arg c "$client" 'any(.[]; .client == $c)' <<< "$matrix" > /dev/null; then
                 continue
             fi
-            case $client in
-            openssl-lts)
-                entry=$(jq -nc --arg label "$LTS_BRANCH" --arg commit "$LTS_COMMIT" --arg digest "${LTS_COMMIT:0:12}" \
-                    '{client: "openssl-lts", label: $label, commit: $commit, curl_branch: "curl-8_18_0",
-                      url: "https://github.com/openssl/openssl/commit/\($commit)", digest: $digest}') ;;
-            openssl-master)
-                entry=$(jq -nc --arg commit "$MASTER_COMMIT" --arg digest "${MASTER_COMMIT:0:12}" \
-                    '{client: "openssl-master", label: "openssl-master", commit: $commit,
-                      url: "https://github.com/openssl/openssl/commit/\($commit)", digest: $digest}') ;;
-            *)
-                resolve_client "$client" ;;
-            esac
+            if [[ $client == openssl-* ]]; then
+                resolve_openssl "$client"
+            else
+                resolve_client "$client"
+            fi
             matrix=$(jq -c --argjson e "$entry" '. + [$e]' <<< "$matrix")
         done
         if [ "$matrix" = '[]' ]; then
@@ -164,7 +150,7 @@ jobs:
             image=$image@$digest
             url=https://github.com/$repo/pkgs/container/$package/${id:-versions}
             label=nginx/nginx-quic-qns#17 SERVER=nginx
-        elif [ "$SERVER" = openssl-lts ] || [ "$SERVER" = openssl-master ]; then
+        elif [[ $SERVER == openssl-* ]]; then
             if [ -z "$server_entry" ]; then
                 echo "::error::server $SERVER needs client $SERVER"
                 exit 1
@@ -311,18 +297,34 @@ jobs:
     - name: Build ${{ matrix.label }}
       if: ${{ matrix.commit }}
       env:
+        CLIENT: ${{ matrix.client }}
         COMMIT: ${{ matrix.commit }}
-        CURL_BRANCH: ${{ matrix.curl_branch }}
+        CURL_BRANCH: curl-8_18_0
       run: |
         dir=openssl-src/test/quic-openssl-docker
-        cat self/.github/patches/quic-hq-interop-*.patch 2> /dev/null |
-            git -C openssl-src apply --allow-empty --stat --apply
+        cp -v self/.github/patches/"$CLIENT"/*.patch self/.github/patches/ 2> /dev/null || true
+        for p in self/.github/patches/*.patch; do
+            [ -f "$p" ] || continue
+            if [[ $CLIENT == openssl-master && ${p##*/} == upstream-* ]]; then
+                rm "$p"
+            elif ! grep -q '^+++ b/test/quic-openssl-docker/' "$p"; then
+                echo "::notice::$CLIENT: include ${p##*/}"
+            elif git -C openssl-src apply -R --check --include='test/quic-openssl-docker/*' < "$p" 2> /dev/null; then
+                echo "::notice::$CLIENT: ignore ${p##*/}"
+                rm "$p"
+            elif git -C openssl-src apply -C1 --include='test/quic-openssl-docker/*' --stat --apply < "$p"; then
+                echo "::notice::$CLIENT: patched ${p##*/}"
+            else
+                echo "::error::$CLIENT: cannot patch ${p##*/}"
+                exit 1
+            fi
+        done
         old='RUN git clone --depth 1 -b \$OPENSSL_BRANCH \$OPENSSL_URL'
-        new='RUN --mount=type=bind,from=patches,target=/openssl-patches git init openssl \&\& git -C openssl fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH \&\& git -C openssl checkout FETCH_HEAD \&\& cat /openssl-patches/*.patch 2> /dev/null \| git -C openssl apply --allow-empty --stat --apply'
+        new='RUN --mount=type=bind,from=patches,target=/openssl-patches git init openssl \&\& git -C openssl fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH \&\& git -C openssl checkout FETCH_HEAD \&\& for p in /openssl-patches/*.patch; do [ -f "$p" ] \|\| continue; git -C openssl apply -R --check --exclude=".github/*" < "$p" 2> /dev/null \&\& continue; git -C openssl apply -C1 --exclude=".github/*" --stat --apply < "$p" \|\| exit 1; done'
         sed -i "s|$old|$new|" "$dir/Dockerfile"
         grep -qF -- 'fetch --depth 1 $OPENSSL_URL $OPENSSL_BRANCH' "$dir/Dockerfile"
 
-        if [ -n "$CURL_BRANCH" ]; then
+        if grep -qF -- 'clone --depth 1 https://github.com/curl/' "$dir/Dockerfile"; then
             sed -i "s|clone --depth 1 https://github.com/curl/|clone --depth 1 -b $CURL_BRANCH https://github.com/curl/|" "$dir/Dockerfile"
             grep -qF -- "-b $CURL_BRANCH " "$dir/Dockerfile"
         fi
@@ -390,12 +392,15 @@ jobs:
         tshark -v | head -1
 
     - name: Patch implementations file
+      env:
+        MATRIX: ${{ needs.resolve.outputs.matrix }}
       run: |
-        jq '. + {
-              "openssl-lts": {image: "openssl-lts-interop", url: "https://github.com/openssl/openssl", role: "both"},
-              "openssl-master": {image: "openssl-master-interop", url: "https://github.com/openssl/openssl", role: "both"}
-            }' implementations_quic.json > implementations.tmp
-        mv implementations.tmp implementations_quic.json
+        for name in $(jq -r '.[].client | select(startswith("openssl-"))' <<< "$MATRIX" | sort -u); do
+            jq --arg n "$name" '. + {($n): {image: "\($n)-interop",
+                  url: "https://github.com/openssl/openssl", role: "both"}}' \
+                implementations_quic.json > implementations.tmp
+            mv implementations.tmp implementations_quic.json
+        done
 
     - name: Set up docker
       uses: docker/setup-docker-action@v5
@@ -469,7 +474,7 @@ jobs:
         import sys
         from testcases_quic import MEASUREMENTS, TESTCASES_QUIC
         names = {t.abbreviation(): t.name() for t in TESTCASES_QUIC + MEASUREMENTS}
-        print(",".join(names[t.strip()] for t in sys.argv[1].split(",")))
+        print(",".join(dict.fromkeys(names[t.strip()] for t in sys.argv[1].split(","))))
         ' "$TESTS")
         fi
         replace=$CLIENT=$CLIENT-interop
@@ -538,7 +543,6 @@ jobs:
 
     - name: Generate summary
       env:
-        OPENSSL_LTS_BRANCH: ${{ needs.resolve.outputs.openssl_lts_branch }}
         SERVER_LABEL: ${{ needs.resolve.outputs.server_label }}
         SERVER_URL: ${{ needs.resolve.outputs.server_url }}
         SERVER_DIGEST: ${{ needs.resolve.outputs.server_digest }}
@@ -547,7 +551,7 @@ jobs:
         if [ -n "$MATRIX" ]; then
             labels=$(jq -r '.[].label' <<< "$MATRIX")
         else
-            labels="${OPENSSL_LTS_BRANCH:-openssl-lts} openssl-master ngtcp2"
+            labels="openssl-3.5 openssl-master ngtcp2"
         fi
         set --
         for label in $labels; do
