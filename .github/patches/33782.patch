@@ -1,0 +1,1018 @@
+From 571957dc44e654cb8947b18791b06a4456157b92 Mon Sep 17 00:00:00 2001
+From: Liu Dongmiao <473522+liudongmiao@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 12:30:52 +0800
+Subject: [PATCH 1/5] quic: do not skip CRYPTO ranges after the first frame in
+ a packet
+
+txp_generate_crypto_frames() used the same counter to skip ranges of
+pending CRYPTO data and to walk the iovecs of each frame. After the
+first frame, the skip count was left at the number of iovecs, so later
+ranges were passed over and sent in a following packet. Use a separate
+counter for the iovecs.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ ssl/quic/quic_txp.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/ssl/quic/quic_txp.c b/ssl/quic/quic_txp.c
+index ebba1cf070316..a2491a7ee3bf1 100644
+--- a/ssl/quic/quic_txp.c
++++ b/ssl/quic/quic_txp.c
+@@ -2156,7 +2156,7 @@ static int txp_generate_crypto_frames(OSSL_QUIC_TX_PACKETISER *txp,
+     uint64_t hdr_bytes;
+     WPACKET *wpkt;
+     QUIC_TXPIM_CHUNK chunk = { 0 };
+-    size_t i, space_left;
++    size_t i, j, space_left;
+ 
+     for (i = 0;; ++i) {
+         space_left = tx_helper_get_space_left(h);
+@@ -2212,8 +2212,8 @@ static int txp_generate_crypto_frames(OSSL_QUIC_TX_PACKETISER *txp,
+             return 0; /* alloc error */
+ 
+         /* Add payload iovecs to the helper (infallible). */
+-        for (i = 0; i < num_stream_iovec; ++i)
+-            tx_helper_append_iovec(h, iov[i].buf, iov[i].buf_len);
++        for (j = 0; j < num_stream_iovec; ++j)
++            tx_helper_append_iovec(h, iov[j].buf, iov[j].buf_len);
+ 
+         *have_ack_eliciting = 1;
+         tx_helper_unrestrict(h); /* no longer need PING */
+
+From eba331c1a7f0e90b81dbb37b6138c048e41536a0 Mon Sep 17 00:00:00 2001
+From: Liu Dongmiao <473522+liudongmiao@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 12:33:48 +0800
+Subject: [PATCH 2/5] quic: clear pending probe requests when a space is
+ discarded
+
+A PTO or anti-deadlock probe still pending for the Initial or Handshake
+space could no longer be sent once that space was discarded, so every
+later datagram was built as a probe, outside congestion control. Clear
+the requests along with the other state of the space.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ ssl/quic/quic_ackm.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/ssl/quic/quic_ackm.c b/ssl/quic/quic_ackm.c
+index bd0fb966e3b42..8e2577a37b7f3 100644
+--- a/ssl/quic/quic_ackm.c
++++ b/ssl/quic/quic_ackm.c
+@@ -1329,6 +1329,11 @@ int ossl_ackm_on_pkt_space_discarded(OSSL_ACKM *ackm, int pkt_space)
+     ackm->time_of_last_ack_eliciting_pkt[pkt_space] = ossl_time_zero();
+     ackm->loss_time[pkt_space] = ossl_time_zero();
+     ackm->pto_count = 0;
++    ackm->pending_probe.pto[pkt_space] = 0;
++    if (pkt_space == QUIC_PN_SPACE_INITIAL)
++        ackm->pending_probe.anti_deadlock_initial = 0;
++    else if (pkt_space == QUIC_PN_SPACE_HANDSHAKE)
++        ackm->pending_probe.anti_deadlock_handshake = 0;
+     ackm->discarded[pkt_space] = 1;
+     ackm->ack_eliciting_bytes_in_flight[pkt_space] = 0;
+     ackm_set_loss_detection_timer(ackm);
+
+From 05ad7b147a470ae98f860ad6719060b4a2eda9d8 Mon Sep 17 00:00:00 2001
+From: Liu Dongmiao <473522+liudongmiao@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 12:35:48 +0800
+Subject: [PATCH 3/5] quic: handle send stream data sent in more than one
+ packet
+
+To let a PTO probe resend data while its original packet stays in
+flight, the send stream must handle one copy being ACKed while another
+is declared lost, and the same bytes being ACKed twice with different
+boundaries.
+
+Lost ranges now skip ACKed bytes, and ACKed ranges leave the new set
+before they are recorded, so no byte is ever in both sets, even on
+allocation failure. A UINT_SET insert that overlaps existing ranges now
+also merges with a range it touches, as other inserts already do.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ ssl/quic/quic_sstream.c | 31 ++++++++++++++++++++++++++++++-
+ ssl/quic/uint_set.c     |  5 +++++
+ 2 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/ssl/quic/quic_sstream.c b/ssl/quic/quic_sstream.c
+index 314104addcb00..e909b30b5f765 100644
+--- a/ssl/quic/quic_sstream.c
++++ b/ssl/quic/quic_sstream.c
+@@ -211,13 +211,37 @@ int ossl_quic_sstream_mark_lost(QUIC_SSTREAM *qss,
+     uint64_t end)
+ {
+     UINT_RANGE r;
++    UINT_SET_ITEM *acked;
++
+     r.start = start;
+     r.end = end;
+ 
+     /*
+      * We lost a range of stream data bytes, so reinsert them into the new set,
+      * so that they are returned once more by ossl_quic_sstream_get_stream_frame.
++     * Bytes already ACKed in another packet, such as a PTO probe, are skipped.
+      */
++    for (acked = ossl_list_uint_set_tail(&qss->acked_set);
++        acked != NULL && acked->range.end >= r.start;
++        acked = ossl_list_uint_set_prev(acked)) {
++        if (acked->range.start > r.end)
++            continue;
++
++        if (acked->range.end < r.end) {
++            UINT_RANGE gap;
++
++            gap.start = acked->range.end + 1;
++            gap.end = r.end;
++            if (!ossl_uint_set_insert(&qss->new_set, &gap))
++                return 0;
++        }
++
++        if (acked->range.start <= r.start)
++            return 1;
++
++        r.end = acked->range.start - 1;
++    }
++
+     if (!ossl_uint_set_insert(&qss->new_set, &r))
+         return 0;
+ 
+@@ -243,7 +267,12 @@ int ossl_quic_sstream_mark_acked(QUIC_SSTREAM *qss,
+     r.start = start;
+     r.end = end;
+ 
+-    if (!ossl_uint_set_insert(&qss->acked_set, &r))
++    /*
++     * A copy of the range may still be queued for retransmission. Remove it
++     * first, so that a failure never leaves a byte both NEW and ACKED.
++     */
++    if (!ossl_uint_set_remove(&qss->new_set, &r)
++        || !ossl_uint_set_insert(&qss->acked_set, &r))
+         return 0;
+ 
+     qss_cull(qss);
+diff --git a/ssl/quic/uint_set.c b/ssl/quic/uint_set.c
+index 4b723869e853d..bcb5af3ee079c 100644
+--- a/ssl/quic/uint_set.c
++++ b/ssl/quic/uint_set.c
+@@ -218,6 +218,11 @@ int ossl_uint_set_insert(UINT_SET *s, const UINT_RANGE *range)
+                 ossl_list_uint_set_remove(s, x);
+                 OPENSSL_free(x);
+             }
++
++            /* The merged range may now touch its neighbours. */
++            uint_set_merge_adjacent(s, ovend);
++            if ((x = ossl_list_uint_set_next(ovend)) != NULL)
++                uint_set_merge_adjacent(s, x);
+             break;
+         } else if (end < z->range.start
+             && (zprev == NULL || start > zprev->range.end)) {
+
+From 995dd655b4a181c193be79b968a7a76752f22961 Mon Sep 17 00:00:00 2001
+From: Liu Dongmiao <473522+liudongmiao@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 12:50:39 +0800
+Subject: [PATCH 4/5] quic: resend unacknowledged Initial CRYPTO data in PTO
+ probes
+
+A PTO probe carried only PING when no new CRYPTO data was pending, so
+the ClientHello was not retransmitted until its packet was declared
+lost, which a long RTT delays past the server's reply.
+
+Request two probes on an Initial PTO, as RFC 9002 s. 6.2.4 allows,
+counting any still pending from an earlier PTO, and fill each with the
+next unacknowledged Initial CRYPTO data that fits. A CRYPTO frame is
+ACK-eliciting, so it may use the byte reserved for PING, and a probe
+can carry as much as the packet it resends. A ClientHello of two
+packets can then be resent in full, and anything beyond the two probes
+stays in flight. When one probe carries all that is left, or nothing
+is left, a single probe is sent.
+
+Fixes #33758
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ include/internal/quic_stream.h | 15 ++++++
+ ssl/quic/quic_ackm.c           | 11 ++--
+ ssl/quic/quic_sstream.c        | 25 ++++++++++
+ ssl/quic/quic_txp.c            | 91 ++++++++++++++++++++++++++++++++--
+ test/quic_ackm_test.c          |  2 +-
+ 5 files changed, 136 insertions(+), 8 deletions(-)
+
+diff --git a/include/internal/quic_stream.h b/include/internal/quic_stream.h
+index 1c0fd3f86e878..94b64fb070250 100644
+--- a/include/internal/quic_stream.h
++++ b/include/internal/quic_stream.h
+@@ -199,6 +199,21 @@ int ossl_quic_sstream_mark_lost(QUIC_SSTREAM *qss,
+  */
+ int ossl_quic_sstream_mark_lost_fin(QUIC_SSTREAM *qss);
+ 
++/**
++ * @brief Gets the first unacknowledged range of stream data at or after an
++ * offset.
++ *
++ * (TX packetiser use.)
++ *
++ * @param qss   the send stream
++ * @param from  the offset to search from
++ * @param start receives the first offset of the range
++ * @param end   receives the last offset of the range, inclusive
++ * @returns 1 if such a range exists, or 0 otherwise
++ */
++int ossl_quic_sstream_get_first_unacked(QUIC_SSTREAM *qss, uint64_t from,
++    uint64_t *start, uint64_t *end);
++
+ /*
+  * (RX/ACKM use.) Marks a logical range of the send stream as having been
+  * acknowledged, meaning that the storage for the data in that range of the
+diff --git a/ssl/quic/quic_ackm.c b/ssl/quic/quic_ackm.c
+index 8e2577a37b7f3..d9fc46628fd76 100644
+--- a/ssl/quic/quic_ackm.c
++++ b/ssl/quic/quic_ackm.c
+@@ -1361,11 +1361,14 @@ static void ackm_queue_probe_anti_deadlock_initial(OSSL_ACKM *ackm)
+ static void ackm_queue_probe(OSSL_ACKM *ackm, int pkt_space)
+ {
+     /*
+-     * TODO(QUIC FUTURE): We are allowed to send either one or two probe
+-     * packets here.
+-     * Determine a strategy for when we should send two probe packets.
++     * We may send one or two probe packets (RFC 9002 s. 6.2.4). Request two
++     * for Initial, so that Initial CRYPTO data of two packets can be resent.
++     * Probes still pending from an earlier PTO count towards the two.
+      */
+-    ++ackm->pending_probe.pto[pkt_space];
++    if (pkt_space == QUIC_PN_SPACE_INITIAL)
++        ackm->pending_probe.pto[pkt_space] = 2;
++    else
++        ++ackm->pending_probe.pto[pkt_space];
+ }
+ 
+ int ossl_ackm_on_timeout(OSSL_ACKM *ackm)
+diff --git a/ssl/quic/quic_sstream.c b/ssl/quic/quic_sstream.c
+index e909b30b5f765..9d69ff87e539f 100644
+--- a/ssl/quic/quic_sstream.c
++++ b/ssl/quic/quic_sstream.c
+@@ -259,6 +259,31 @@ int ossl_quic_sstream_mark_lost_fin(QUIC_SSTREAM *qss)
+     return 1;
+ }
+ 
++int ossl_quic_sstream_get_first_unacked(QUIC_SSTREAM *qss, uint64_t from,
++    uint64_t *start, uint64_t *end)
++{
++    UINT_SET_ITEM *acked;
++
++    *start = from;
++    for (acked = ossl_list_uint_set_head(&qss->acked_set); acked != NULL;
++        acked = ossl_list_uint_set_next(acked)) {
++        if (acked->range.end < *start)
++            continue;
++
++        if (acked->range.start > *start)
++            break;
++
++        *start = acked->range.end + 1;
++    }
++
++    if (*start >= qss->ring_buf.head_offset)
++        return 0;
++
++    *end = acked != NULL ? acked->range.start - 1
++                         : qss->ring_buf.head_offset - 1;
++    return 1;
++}
++
+ int ossl_quic_sstream_mark_acked(QUIC_SSTREAM *qss,
+     uint64_t start,
+     uint64_t end)
+diff --git a/ssl/quic/quic_txp.c b/ssl/quic/quic_txp.c
+index a2491a7ee3bf1..2bd713b2890ac 100644
+--- a/ssl/quic/quic_txp.c
++++ b/ssl/quic/quic_txp.c
+@@ -69,6 +69,9 @@ struct ossl_quic_tx_packetiser_st {
+ 
+     size_t unvalidated_credit; /* Limit of data we can send until validated */
+ 
++    /* Initial CRYPTO offset after the data sent in pending PTO probes. */
++    uint64_t probe_crypto_next;
++
+     /* Internal state - frame (re)generation flags. */
+     unsigned int want_handshake_done : 1;
+     unsigned int want_max_data : 1;
+@@ -277,6 +280,15 @@ static size_t tx_helper_get_space_left(struct tx_helper *h)
+         - (h->reserve_allowed ? 0 : h->reserve) - h->bytes_appended;
+ }
+ 
++/*
++ * How many more bytes of space do we have left for an ACK-eliciting frame? It
++ * may use the bytes reserved for PING.
++ */
++static size_t tx_helper_get_space_left_ack_eliciting(struct tx_helper *h)
++{
++    return h->max_ppl - h->bytes_appended;
++}
++
+ /*
+  * Begin a control frame serialization transaction. This allows the
+  * serialization of the control frame to be backed out if it turns out it won't
+@@ -2141,6 +2153,71 @@ static int determine_stream_len(struct tx_helper *h,
+     return determine_len(space_left, orig_len, base_hdr_len, hlen, len);
+ }
+ 
++/*
++ * Resend unacknowledged Initial CRYPTO data, such as the ClientHello, in a PTO
++ * probe rather than a bare PING (RFC 9002 s. 6.2.4). Each probe takes what fits
++ * after the data of the probe before it, and the rest stays in flight. On
++ * allocation failure the probe carries what was queued, or a PING.
++ */
++static void txp_requeue_crypto_for_probe(OSSL_QUIC_TX_PACKETISER *txp,
++    struct txp_pkt *pkt)
++{
++    QUIC_SSTREAM *crypto = txp->args.crypto[QUIC_PN_SPACE_INITIAL];
++    OSSL_ACKM_PROBE_INFO *probe = ossl_ackm_get0_probe_request(txp->args.ackm);
++    OSSL_QUIC_FRAME_CRYPTO chdr = { 0 };
++    uint64_t from = txp->probe_crypto_next, start, end, hdr_bytes;
++    size_t space_left;
++
++    if (pkt->h.enc_level != QUIC_ENC_LEVEL_INITIAL
++        || probe->pto[QUIC_PN_SPACE_INITIAL] == 0)
++        return;
++
++    /*
++     * Data requeued here stays queued even if the probe is not sent, so wait
++     * until the anti-amplification limit lets a full probe out.
++     */
++    if (!ossl_quic_tx_packetiser_check_unvalidated_credit(txp,
++            pkt->h.max_ppl + pkt->geom.pkt_overhead))
++        return;
++
++    space_left = tx_helper_get_space_left_ack_eliciting(&pkt->h);
++    while (space_left >= MIN_FRAME_SIZE_CRYPTO
++        && ossl_quic_sstream_get_first_unacked(crypto, from, &start, &end)) {
++        chdr.offset = start;
++        chdr.len = end - start + 1;
++        if (!determine_crypto_len(&pkt->h, &chdr, space_left, &hdr_bytes,
++                &chdr.len)
++            || !ossl_quic_sstream_mark_lost(crypto, start,
++                start + chdr.len - 1))
++            break;
++
++        from = start + chdr.len;
++        space_left -= (size_t)(hdr_bytes + chdr.len);
++    }
++}
++
++/*
++ * After an Initial PTO probe is sent, start the next one after the CRYPTO data
++ * it carried. With nothing more to resend, a single probe is enough.
++ */
++static void txp_crypto_probe_sent(OSSL_QUIC_TX_PACKETISER *txp,
++    QUIC_TXPIM_PKT *tpkt, OSSL_ACKM_PROBE_INFO *probe)
++{
++    QUIC_SSTREAM *crypto = txp->args.crypto[QUIC_PN_SPACE_INITIAL];
++    const QUIC_TXPIM_CHUNK *chunks = ossl_quic_txpim_pkt_get_chunks(tpkt);
++    size_t i, num_chunks = ossl_quic_txpim_pkt_get_num_chunks(tpkt);
++    uint64_t start, end;
++
++    for (i = 0; i < num_chunks; ++i)
++        if (chunks[i].stream_id == UINT64_MAX
++            && chunks[i].end >= txp->probe_crypto_next)
++            txp->probe_crypto_next = chunks[i].end + 1;
++
++    if (!ossl_quic_sstream_get_first_unacked(crypto, txp->probe_crypto_next,
++            &start, &end))
++        probe->pto[QUIC_PN_SPACE_INITIAL] = 0;
++}
++
+ static int txp_generate_crypto_frames(OSSL_QUIC_TX_PACKETISER *txp,
+     struct txp_pkt *pkt,
+     int *have_ack_eliciting)
+@@ -2159,7 +2236,7 @@ static int txp_generate_crypto_frames(OSSL_QUIC_TX_PACKETISER *txp,
+     size_t i, j, space_left;
+ 
+     for (i = 0;; ++i) {
+-        space_left = tx_helper_get_space_left(h);
++        space_left = tx_helper_get_space_left_ack_eliciting(h);
+ 
+         if (space_left < MIN_FRAME_SIZE_CRYPTO)
+             return 1; /* no point trying */
+@@ -2889,9 +2966,11 @@ static int txp_generate_for_el(OSSL_QUIC_TX_PACKETISER *txp,
+             done_pre_token = 1;
+ 
+     /* CRYPTO Frames */
+-    if (a.allow_crypto)
++    if (a.allow_crypto) {
++        txp_requeue_crypto_for_probe(txp, pkt);
+         if (!txp_generate_crypto_frames(txp, pkt, &have_ack_eliciting))
+             goto fatal_err;
++    }
+ 
+     /* Stream-specific frames */
+     if (a.allow_stream_rel && txp->handshake_complete)
+@@ -3175,8 +3254,14 @@ static int txp_pkt_commit(OSSL_QUIC_TX_PACKETISER *txp,
+             --probe_info->anti_deadlock_handshake;
+ 
+         if (a.allow_force_ack_eliciting /* (i.e., not for 0-RTT) */
+-            && probe_info->pto[pn_space] > 0)
++            && probe_info->pto[pn_space] > 0) {
+             --probe_info->pto[pn_space];
++            if (pn_space == QUIC_PN_SPACE_INITIAL)
++                txp_crypto_probe_sent(txp, tpkt, probe_info);
++        }
++
++        if (probe_info->pto[QUIC_PN_SPACE_INITIAL] == 0)
++            txp->probe_crypto_next = 0;
+     }
+ 
+     ossl_quic_fifd_pkt_discard_unreliable(&txp->fifd, tpkt);
+diff --git a/test/quic_ackm_test.c b/test/quic_ackm_test.c
+index 13c35dcb2938f..c2efd83e4944f 100644
+--- a/test/quic_ackm_test.c
++++ b/test/quic_ackm_test.c
+@@ -506,7 +506,7 @@ static int test_tx_ack_case_actual(int tidx, int space, int mode)
+                     goto err;
+             } else {
+                 if (!TEST_int_eq(test_probe_counts(&probe, 0, 0,
+-                                     space == QUIC_PN_SPACE_INITIAL,
++                                     space == QUIC_PN_SPACE_INITIAL ? 2 : 0,
+                                      space == QUIC_PN_SPACE_HANDSHAKE,
+                                      space == QUIC_PN_SPACE_APP),
+                         1))
+
+From cd99f58e432c4bf967b42426b57727136e60fbbd Mon Sep 17 00:00:00 2001
+From: Liu Dongmiao <473522+liudongmiao@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 06:10:24 +0800
+Subject: [PATCH 5/5] quic: test Initial PTO probes and stream data sent twice
+
+Add quic_txp_test scripts for Initial PTO probes with CRYPTO data of
+four, two and one packets in flight, with an acknowledged gap, and with
+the second probe deferred until anti-amplification credit is available.
+Check that the probes carry consecutive CRYPTO data, that nothing is
+sent after them, and that a second PTO counts a pending probe towards
+the two. Also check that discarding the Initial space clears its
+pending PTO and anti-deadlock probes.
+
+Add test_sstream_two_copies to quic_stream_test. One copy of the data
+is ACKed and the other is declared lost, in either order, with full and
+partial ACKs. Add test_sstream_ack_merge for an ACK that overlaps one
+ACKed range and touches the next.
+
+Co-authored-by: Mounir IDRASSI <mounir.idrassi@idrix.fr>
+Assisted-by: Claude:claude-opus-5-5
+---
+ test/quic_stream_test.c | 117 ++++++++++++
+ test/quic_txp_test.c    | 401 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 518 insertions(+)
+
+diff --git a/test/quic_stream_test.c b/test/quic_stream_test.c
+index 35498a24b76c6..e18e25256958f 100644
+--- a/test/quic_stream_test.c
++++ b/test/quic_stream_test.c
+@@ -377,6 +377,121 @@ static int test_sstream_bulk(int idx)
+     return testresult;
+ }
+ 
++static const unsigned char data_2[] = "abcdefghijklmnopqrstuvwxy";
++
++/* A length of 0 expects no frame at idx */
++static int check_stream_frame(QUIC_SSTREAM *sstream, size_t idx,
++    uint64_t offset, uint64_t len)
++{
++    OSSL_QUIC_FRAME_STREAM hdr;
++    OSSL_QTX_IOVEC iov[2];
++    size_t i, num_iov = OSSL_NELEM(iov), total = 0;
++
++    if (!ossl_quic_sstream_get_stream_frame(sstream, idx, &hdr, iov, &num_iov))
++        return TEST_uint64_t_eq(len, 0);
++
++    if (!TEST_uint64_t_eq(hdr.offset, offset)
++        || !TEST_uint64_t_eq(hdr.len, len))
++        return 0;
++
++    for (i = 0; i < num_iov; ++i) {
++        if (!TEST_mem_eq(iov[i].buf, iov[i].buf_len,
++                data_2 + offset + total, iov[i].buf_len))
++            return 0;
++
++        total += iov[i].buf_len;
++    }
++
++    return TEST_uint64_t_eq(total, len);
++}
++
++/*
++ * One copy of the data is ACKed and another is declared lost, in either order,
++ * as when a PTO probe resends data that is still in flight.
++ */
++static int test_sstream_two_copies(int idx)
++{
++    int testresult = 0, ack_first = idx & 1, partial = idx & 2;
++    QUIC_SSTREAM *sstream = NULL;
++    size_t consumed = 0;
++
++    if (!TEST_ptr(sstream = ossl_quic_sstream_new(32))
++        || !TEST_true(ossl_quic_sstream_append(sstream, data_2, 24, &consumed))
++        || !TEST_size_t_eq(consumed, 24)
++        || !TEST_true(ossl_quic_sstream_mark_transmitted(sstream, 0, 23))
++        || !TEST_true(ossl_quic_sstream_mark_lost(sstream, 0, 23))
++        || !TEST_true(ossl_quic_sstream_mark_transmitted(sstream, 0, 23)))
++        goto err;
++
++    if (!ack_first && !TEST_true(ossl_quic_sstream_mark_lost(sstream, 0, 23)))
++        goto err;
++
++    if (partial) {
++        if (!TEST_true(ossl_quic_sstream_mark_acked(sstream, 0, 5))
++            || !TEST_true(ossl_quic_sstream_mark_acked(sstream, 12, 15)))
++            goto err;
++    } else if (!TEST_true(ossl_quic_sstream_mark_acked(sstream, 0, 23))) {
++        goto err;
++    }
++
++    if (ack_first && !TEST_true(ossl_quic_sstream_mark_lost(sstream, 0, 23)))
++        goto err;
++
++    /* Only bytes not ACKed are sent again, and the ACKed prefix is culled */
++    if (partial) {
++        if (!check_stream_frame(sstream, 0, 6, 6)
++            || !check_stream_frame(sstream, 1, 16, 8)
++            || !check_stream_frame(sstream, 2, 0, 0)
++            || !TEST_false(ossl_quic_sstream_is_totally_acked(sstream))
++            || !TEST_size_t_eq(ossl_quic_sstream_get_buffer_used(sstream), 18))
++            goto err;
++    } else {
++        if (!check_stream_frame(sstream, 0, 0, 0)
++            || !TEST_true(ossl_quic_sstream_is_totally_acked(sstream))
++            || !TEST_size_t_eq(ossl_quic_sstream_get_buffer_used(sstream), 0))
++            goto err;
++
++        /* New data is sent next, so no culled range is left pending */
++        if (!TEST_true(ossl_quic_sstream_append(sstream, data_2 + 24, 1,
++                &consumed))
++            || !check_stream_frame(sstream, 0, 24, 1)
++            || !check_stream_frame(sstream, 1, 0, 0))
++            goto err;
++    }
++
++    testresult = 1;
++err:
++    ossl_quic_sstream_free(sstream);
++    return testresult;
++}
++
++/*
++ * An ACK that overlaps one ACKed range and touches the next merges all of
++ * them, so the stream is totally acknowledged and its buffer culled.
++ */
++static int test_sstream_ack_merge(void)
++{
++    int testresult = 0;
++    QUIC_SSTREAM *sstream = NULL;
++    size_t consumed = 0;
++
++    if (!TEST_ptr(sstream = ossl_quic_sstream_new(32))
++        || !TEST_true(ossl_quic_sstream_append(sstream, data_2, 24, &consumed))
++        || !TEST_size_t_eq(consumed, 24)
++        || !TEST_true(ossl_quic_sstream_mark_transmitted(sstream, 0, 23))
++        || !TEST_true(ossl_quic_sstream_mark_acked(sstream, 0, 5))
++        || !TEST_true(ossl_quic_sstream_mark_acked(sstream, 12, 23))
++        || !TEST_true(ossl_quic_sstream_mark_acked(sstream, 3, 11))
++        || !TEST_true(ossl_quic_sstream_is_totally_acked(sstream))
++        || !TEST_size_t_eq(ossl_quic_sstream_get_buffer_used(sstream), 0))
++        goto err;
++
++    testresult = 1;
++err:
++    ossl_quic_sstream_free(sstream);
++    return testresult;
++}
++
+ static int test_single_copy_read(QUIC_RSTREAM *qrs,
+     unsigned char *buf, size_t size,
+     size_t *readbytes, int *fin)
+@@ -3489,6 +3604,8 @@ int setup_tests(void)
+ {
+     ADD_TEST(test_sstream_simple);
+     ADD_ALL_TESTS(test_sstream_bulk, 100);
++    ADD_ALL_TESTS(test_sstream_two_copies, 4);
++    ADD_TEST(test_sstream_ack_merge);
+     ADD_ALL_TESTS(test_rstream_simple, 2);
+     ADD_ALL_TESTS(test_rstream_random, 100);
+     ADD_TEST(test_rstream_pkt);
+diff --git a/test/quic_txp_test.c b/test/quic_txp_test.c
+index 38006e7e3d409..262a95683c284 100644
+--- a/test/quic_txp_test.c
++++ b/test/quic_txp_test.c
+@@ -1685,6 +1685,402 @@ static int test_script(int idx)
+     return run_script(idx, scripts[idx]);
+ }
+ 
++/*
++ * Helpers for the Initial PTO scripts. The byte at offset o of their CRYPTO
++ * data is o % 251, so each probe payload can be checked against its offset.
++ * probe_crypto_end is the end of the CRYPTO data carried by the probes so far.
++ */
++static uint64_t probe_crypto_end;
++
++static void fill_pto_crypto(unsigned char *buf, size_t len)
++{
++    size_t i;
++
++    for (i = 0; i < len; ++i)
++        buf[i] = (unsigned char)(i % 251);
++}
++
++static int check_crypto_data(struct helper *h)
++{
++    size_t i;
++
++    if (!TEST_uint64_t_gt(h->frame.crypto.len, 0))
++        return 0;
++
++    for (i = 0; i < h->frame.crypto.len; ++i)
++        if (!TEST_uchar_eq(h->frame.crypto.data[i],
++                (unsigned char)((h->frame.crypto.offset + i) % 251)))
++            return 0;
++
++    return 1;
++}
++
++static int trigger_pto(struct helper *h)
++{
++    return TEST_true(ossl_ackm_on_timeout(h->args.ackm));
++}
++
++static int check_first_probe(struct helper *h)
++{
++    probe_crypto_end = h->frame.crypto.offset + h->frame.crypto.len;
++    return TEST_uint64_t_eq(h->frame.crypto.offset, 0)
++        && check_crypto_data(h);
++}
++
++static int check_next_probe(struct helper *h)
++{
++    if (!TEST_uint64_t_eq(h->frame.crypto.offset, probe_crypto_end)
++        || !check_crypto_data(h))
++        return 0;
++
++    probe_crypto_end += h->frame.crypto.len;
++    return 1;
++}
++
++static int check_nothing_sent(struct helper *h)
++{
++    QUIC_TXP_STATUS status;
++
++    return TEST_true(ossl_quic_tx_packetiser_generate(h->txp, &status))
++        && TEST_size_t_eq(status.sent_pkt, 0);
++}
++
++/* Keep the PTO tests usable on branches that lack flush_qtx */
++static int pto_flush_qtx(struct helper *h)
++{
++    ossl_qtx_finish_dgram(h->args.qtx);
++    ossl_qtx_flush_net(h->args.qtx);
++    return 1;
++}
++
++/* Initial PTO with four packets of CRYPTO data in flight */
++static unsigned char pto_crypto_1[3600];
++
++static const struct script_op pto_script_1[] = {
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_INITIAL, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_CRYPTO_SEND, QUIC_PN_SPACE_INITIAL, 0, pto_crypto_1,
++        sizeof(pto_crypto_1) },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_CHECK, 0, 0, NULL, 0, trigger_pto },
++    /* two probes carry consecutive data */
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_first_probe },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_next_probe },
++    { OPK_EXPECT_NO_FRAME },
++    /* the rest of pto_crypto_1 stays in flight */
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    { OPK_CHECK, 0, 0, NULL, 0, pto_flush_qtx },
++    { OPK_RX_PKT_NONE },
++    { OPK_END }
++};
++
++/* Initial PTO with two full packets of CRYPTO data in flight */
++static unsigned char pto_crypto_2[2312];
++
++static int check_all_sent_2(struct helper *h)
++{
++    return TEST_uint64_t_eq(probe_crypto_end, sizeof(pto_crypto_2));
++}
++
++static const struct script_op pto_script_2[] = {
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_INITIAL, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_CRYPTO_SEND, QUIC_PN_SPACE_INITIAL, 0, pto_crypto_2,
++        sizeof(pto_crypto_2) },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_CHECK, 0, 0, NULL, 0, trigger_pto },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_first_probe },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_next_probe },
++    { OPK_EXPECT_NO_FRAME },
++    /* together, the two probes carry all the CRYPTO data */
++    { OPK_CHECK, 0, 0, NULL, 0, check_all_sent_2 },
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    { OPK_CHECK, 0, 0, NULL, 0, pto_flush_qtx },
++    { OPK_RX_PKT_NONE },
++    { OPK_END }
++};
++
++/* Initial PTO with CRYPTO data of one packet in flight */
++static unsigned char pto_crypto_3[64];
++
++static int check_all_sent_3(struct helper *h)
++{
++    return TEST_uint64_t_eq(probe_crypto_end, sizeof(pto_crypto_3));
++}
++
++static const struct script_op pto_script_3[] = {
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_INITIAL, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_CRYPTO_SEND, QUIC_PN_SPACE_INITIAL, 0, pto_crypto_3,
++        sizeof(pto_crypto_3) },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_CHECK, 0, 0, NULL, 0, trigger_pto },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_first_probe },
++    { OPK_CHECK, 0, 0, NULL, 0, check_all_sent_3 },
++    { OPK_EXPECT_NO_FRAME },
++    /* with nothing more to resend, a single probe is sent */
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    { OPK_CHECK, 0, 0, NULL, 0, pto_flush_qtx },
++    { OPK_RX_PKT_NONE },
++    { OPK_END }
++};
++
++/* Initial PTO with an acknowledged gap in the CRYPTO data */
++static unsigned char pto_crypto_4[64];
++
++static int ack_gap_4(struct helper *h)
++{
++    return TEST_true(ossl_quic_sstream_mark_acked(
++        h->args.crypto[QUIC_PN_SPACE_INITIAL], 16, 31));
++}
++
++static int check_before_gap_4(struct helper *h)
++{
++    return TEST_uint64_t_eq(h->frame.crypto.offset, 0)
++        && TEST_uint64_t_eq(h->frame.crypto.len, 16)
++        && check_crypto_data(h);
++}
++
++static int check_after_gap_4(struct helper *h)
++{
++    return TEST_uint64_t_eq(h->frame.crypto.offset, 32)
++        && TEST_uint64_t_eq(h->frame.crypto.len, 32)
++        && check_crypto_data(h);
++}
++
++static const struct script_op pto_script_4[] = {
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_INITIAL, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_CRYPTO_SEND, QUIC_PN_SPACE_INITIAL, 0, pto_crypto_4,
++        sizeof(pto_crypto_4) },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_CHECK, 0, 0, NULL, 0, ack_gap_4 },
++    { OPK_CHECK, 0, 0, NULL, 0, trigger_pto },
++    /* both ranges around the gap go into the first probe */
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_before_gap_4 },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_after_gap_4 },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    { OPK_CHECK, 0, 0, NULL, 0, pto_flush_qtx },
++    { OPK_RX_PKT_NONE },
++    { OPK_END }
++};
++
++/* Discarding the Initial space clears a pending PTO probe */
++static int check_pto_pending(struct helper *h)
++{
++    OSSL_ACKM_PROBE_INFO *probe = ossl_ackm_get0_probe_request(h->args.ackm);
++
++    return TEST_uint_gt(probe->pto[QUIC_PN_SPACE_INITIAL], 0);
++}
++
++static int check_anti_deadlock_pending(struct helper *h)
++{
++    OSSL_ACKM_PROBE_INFO *probe = ossl_ackm_get0_probe_request(h->args.ackm);
++
++    return TEST_uint_gt(probe->anti_deadlock_initial, 0);
++}
++
++static int discard_initial(struct helper *h)
++{
++    OSSL_ACKM_PROBE_INFO *probe = ossl_ackm_get0_probe_request(h->args.ackm);
++
++    return TEST_true(ossl_ackm_on_pkt_space_discarded(h->args.ackm,
++               QUIC_PN_SPACE_INITIAL))
++        && TEST_uint_eq(probe->pto[QUIC_PN_SPACE_INITIAL], 0)
++        && TEST_uint_eq(probe->anti_deadlock_initial, 0);
++}
++
++static const struct script_op pto_script_5[] = {
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_INITIAL, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_CRYPTO_SEND, QUIC_PN_SPACE_INITIAL, 0, pto_crypto_3,
++        sizeof(pto_crypto_3) },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_CHECK, 0, 0, NULL, 0, trigger_pto },
++    { OPK_CHECK, 0, 0, NULL, 0, check_pto_pending },
++    { OPK_CHECK, 0, 0, NULL, 0, discard_initial },
++    { OPK_END }
++};
++
++/* Discarding the Initial space clears a pending anti-deadlock probe */
++static const struct script_op pto_script_6[] = {
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_INITIAL, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    /* with nothing in flight, the timeout asks for an anti-deadlock probe */
++    { OPK_CHECK, 0, 0, NULL, 0, trigger_pto },
++    { OPK_CHECK, 0, 0, NULL, 0, check_anti_deadlock_pending },
++    { OPK_CHECK, 0, 0, NULL, 0, discard_initial },
++    { OPK_END }
++};
++
++/* Scripts that need an unvalidated path, set up by OPK_NO_VALIDATION */
++#ifdef OPK_NO_VALIDATION
++/* Initial PTO probes when anti-amplification credit runs out */
++static int rx_initial_7(struct helper *h)
++{
++    OSSL_ACKM_RX_PKT pkt = { 0 };
++
++    pkt.time = fake_now(NULL);
++    pkt.pkt_space = QUIC_PN_SPACE_INITIAL;
++    pkt.is_ack_eliciting = 1;
++    return TEST_true(ossl_ackm_on_rx_packet(h->args.ackm, &pkt));
++}
++
++static const struct script_op pto_script_7[] = {
++    { OPK_NO_VALIDATION },
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_INITIAL, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    /* 3 * 1600 = 4800 covers the four datagrams of pto_crypto_1 */
++    { OPK_ADD_CREDIT, 1600 },
++    { OPK_CRYPTO_SEND, QUIC_PN_SPACE_INITIAL, 0, pto_crypto_1,
++        sizeof(pto_crypto_1) },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_CHECK, 0, 0, NULL, 0, trigger_pto },
++    /* credit for one datagram, so the second probe is not sent yet */
++    { OPK_ADD_CREDIT, 400 },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_first_probe },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    { OPK_CHECK, 0, 0, NULL, 0, flush_qtx },
++    { OPK_RX_PKT_NONE },
++    /* receiving an Initial packet adds credit and an ACK to send */
++    { OPK_CHECK, 0, 0, NULL, 0, rx_initial_7 },
++    { OPK_ADD_CREDIT, 1000 },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_ACK_WITHOUT_ECN },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_next_probe },
++    { OPK_EXPECT_NO_FRAME },
++    /* the rest of pto_crypto_1 stays in flight */
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    { OPK_CHECK, 0, 0, NULL, 0, flush_qtx },
++    { OPK_RX_PKT_NONE },
++    { OPK_END }
++};
++
++/* Two Initial PTOs while anti-amplification credit runs out */
++static const struct script_op pto_script_8[] = {
++    { OPK_NO_VALIDATION },
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_INITIAL, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    /* 3 * 1600 = 4800 covers the four datagrams of pto_crypto_1 */
++    { OPK_ADD_CREDIT, 1600 },
++    { OPK_CRYPTO_SEND, QUIC_PN_SPACE_INITIAL, 0, pto_crypto_1,
++        sizeof(pto_crypto_1) },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    /* credit for one datagram, so the second probe is not sent yet */
++    { OPK_CHECK, 0, 0, NULL, 0, trigger_pto },
++    { OPK_ADD_CREDIT, 400 },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_first_probe },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    /* a second PTO tops the pending probes up to two */
++    { OPK_CHECK, 0, 0, NULL, 0, trigger_pto },
++    { OPK_ADD_CREDIT, 1200 },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_next_probe },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_next_probe },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    { OPK_CHECK, 0, 0, NULL, 0, flush_qtx },
++    { OPK_RX_PKT_NONE },
++    { OPK_END }
++};
++#endif
++
++static const struct script_op *const pto_scripts[] = {
++    pto_script_1,
++    pto_script_2,
++    pto_script_3,
++    pto_script_4,
++    pto_script_5,
++    pto_script_6,
++#ifdef OPK_NO_VALIDATION
++    pto_script_7,
++    pto_script_8,
++#endif
++};
++
++static int test_pto_script(int idx)
++{
++    return run_script(idx, pto_scripts[idx]);
++}
++
+ /*
+  * Dynamic Script 1.
+  *
+@@ -1768,6 +2164,11 @@ static int test_dyn_script_1(int idx)
+ 
+ int setup_tests(void)
+ {
++    fill_pto_crypto(pto_crypto_1, sizeof(pto_crypto_1));
++    fill_pto_crypto(pto_crypto_2, sizeof(pto_crypto_2));
++    fill_pto_crypto(pto_crypto_3, sizeof(pto_crypto_3));
++    fill_pto_crypto(pto_crypto_4, sizeof(pto_crypto_4));
++    ADD_ALL_TESTS(test_pto_script, OSSL_NELEM(pto_scripts));
+     ADD_ALL_TESTS(test_script, OSSL_NELEM(scripts));
+     ADD_ALL_TESTS(test_dyn_script_1,
+         (int)(OSSL_NELEM(dyn_script_1_crypto_1a)

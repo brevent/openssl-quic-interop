@@ -1,0 +1,41 @@
+From 5a59e81093863847fd2363d6af848b3dd6a16ef3 Mon Sep 17 00:00:00 2001
+From: Liu Dongmiao <473522+liudongmiao@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 09:11:09 +0800
+Subject: [PATCH] quic-openssl-docker: support the multiconnect test case on
+ the client
+
+The interop runner passes multiconnect to both endpoints for the
+handshakeloss (L1) and handshakecorruption (C1) tests, which
+run_endpoint.sh rejected as unsupported.
+
+On the client, download each file over its own connection, one after
+another. Leave the server rejecting it, as the server handles one
+connection at a time.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ test/quic-openssl-docker/run_endpoint.sh | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/test/quic-openssl-docker/run_endpoint.sh b/test/quic-openssl-docker/run_endpoint.sh
+index b1ba0346922b3..57e1d54589460 100644
+--- a/test/quic-openssl-docker/run_endpoint.sh
++++ b/test/quic-openssl-docker/run_endpoint.sh
+@@ -60,6 +60,17 @@ if [ "$ROLE" == "client" ]; then
+         done
+         exit 0
+         ;;
++    "multiconnect")
++        for req in $REQUESTS
++        do
++            OUTFILE=$(basename $req)
++            echo -n "$OUTFILE " > ./reqfile.txt
++            HOSTNAME=$(printf "%s\n" "$req" | sed -ne 's,^https://\([^/:]*\).*,\1,p')
++            HOSTPORT=$(printf "%s\n" "$req" | sed -ne 's,^https://[^:/]*:\([^/]*\).*,\1,p')
++            SSLKEYLOGFILE=/logs/keys.log SSL_CERT_FILE=/certs/ca.pem SSL_CERT_DIR=/certs quic-hq-interop $HOSTNAME $HOSTPORT ./reqfile.txt || exit 1
++        done
++        exit 0
++        ;;
+     "chacha20")
+         for req in $REQUESTS
+         do
