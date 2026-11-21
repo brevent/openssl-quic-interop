@@ -1,0 +1,112 @@
+From 3b8973cfc45d64c64aa000bcb600afd07415921b Mon Sep 17 00:00:00 2001
+From: Liu Dongmiao <473522+liudongmiao@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 09:11:09 +0800
+Subject: [PATCH] quic-openssl-docker: support the keyupdate test case
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The interop runner passes keyupdate to the client for the keyupdate (U)
+test, which run_endpoint.sh rejected as unsupported.
+
+Handle keyupdate like transfer, with KEY_UPDATE set so that
+quic-hq-interop initiates one key update once the handshake is
+confirmed.
+
+Run keyupdate in the QUIC interop workflow with OpenSSL as the client,
+which is the endpoint that initiates the key update.
+
+Refs #33572
+
+Assisted-by: Claude:claude-opus-5-5
+Reviewed-by: Neil Horman <nhorman@openssl.org>
+Reviewed-by: Saša Nedvědický <sashan@openssl.org>
+Merge-date: Fri Nov 20 16:34:22 2026
+Merged-from: https://github.com/openssl/openssl/pull/33781
+---
+ .github/workflows/run_quic_interop.yml            |  4 ++--
+ .../hq-interop/quic-hq-interop.c                  | 15 +++++++++++++++
+ test/quic-openssl-docker/run_endpoint.sh          | 15 +++++++++++++++
+ 3 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/.github/workflows/run_quic_interop.yml b/.github/workflows/run_quic_interop.yml
+index b36785c0c544b..16fe37a95cf9e 100644
+--- a/.github/workflows/run_quic_interop.yml
++++ b/.github/workflows/run_quic_interop.yml
+@@ -62,7 +62,7 @@ jobs:
+     runs-on: ubuntu-latest
+     strategy:
+       matrix:
+-        tests: [http3, transfer, handshake, retry, chacha20, resumption, multiplexing, ipv6]
++        tests: [http3, transfer, handshake, retry, chacha20, resumption, multiplexing, ipv6, keyupdate]
+         servers: [quic-go, ngtcp2, mvfst, quiche, nginx, msquic, haproxy, msquic-openssl]
+         exclude:
+           - servers: msquic
+@@ -183,7 +183,7 @@ jobs:
+     runs-on: ubuntu-latest
+     strategy:
+       matrix:
+-        tests: [http3, transfer, handshake, retry, chacha20, resumption, multiplexing, ipv6]
++        tests: [http3, transfer, handshake, retry, chacha20, resumption, multiplexing, ipv6, keyupdate]
+         servers: [quic-go, ngtcp2, mvfst, quiche, nginx, msquic, haproxy, msquic-openssl]
+         exclude:
+           - servers: msquic
+diff --git a/test/quic-openssl-docker/hq-interop/quic-hq-interop.c b/test/quic-openssl-docker/hq-interop/quic-hq-interop.c
+index 27ad63efa045e..f332ff129a43a 100644
+--- a/test/quic-openssl-docker/hq-interop/quic-hq-interop.c
++++ b/test/quic-openssl-docker/hq-interop/quic-hq-interop.c
+@@ -875,6 +875,7 @@ int main(int argc, char *argv[])
+     size_t this_poll_count = 0;
+     char *req = NULL;
+     char *hostname, *port;
++    int key_update = getenv("KEY_UPDATE") != NULL;
+ 
+     if (argc < 4) {
+         fprintf(stderr, "Usage: quic-hq-interop hostname port reqfile\n");
+@@ -993,6 +994,20 @@ int main(int argc, char *argv[])
+                  */
+                 if (!eof) {
+                     BIO_write(outbiolist[poll_idx], buf, readbytes);
++                    /*
++                     * QUIC allows a key update only after the handshake is
++                     * confirmed (RFC 9001 6.1). The client cannot query that
++                     * state, so try on each read until it succeeds, dropping
++                     * the error raised by an early attempt.
++                     */
++                    if (key_update && readbytes > 0) {
++                        ERR_set_mark();
++                        if (SSL_key_update(ssl, SSL_KEY_UPDATE_REQUESTED)) {
++                            fprintf(stderr, "key update initiated\n");
++                            key_update = 0;
++                        }
++                        ERR_pop_to_mark();
++                    }
+                 } else {
+                     fprintf(stderr, "completed %s\n", outnames[poll_idx]);
+                     /* This file is done, take it out of polling contention */
+diff --git a/test/quic-openssl-docker/run_endpoint.sh b/test/quic-openssl-docker/run_endpoint.sh
+index b1ba0346922b3..51b2022d340f0 100644
+--- a/test/quic-openssl-docker/run_endpoint.sh
++++ b/test/quic-openssl-docker/run_endpoint.sh
+@@ -49,6 +49,21 @@ if [ "$ROLE" == "client" ]; then
+         SSLKEYLOGFILE=/logs/keys.log SSL_CERT_FILE=/certs/ca.pem SSL_CERT_DIR=/certs quic-hq-interop $HOSTNAME $HOSTPORT ./reqfile.txt || exit 1
+         exit 0
+         ;;
++    "keyupdate")
++        HOSTNAME=none
++        for req in $REQUESTS
++        do
++            OUTFILE=$(basename $req)
++            if [ "$HOSTNAME" == "none" ]
++            then
++                HOSTNAME=$(printf "%s\n" "$req" | sed -ne 's,^https://\([^/:]*\).*,\1,p')
++                HOSTPORT=$(printf "%s\n" "$req" | sed -ne 's,^https://[^:/]*:\([^/]*\).*,\1,p')
++            fi
++            echo -n "$OUTFILE " >> ./reqfile.txt
++        done
++        KEY_UPDATE=yes SSLKEYLOGFILE=/logs/keys.log SSL_CERT_FILE=/certs/ca.pem SSL_CERT_DIR=/certs quic-hq-interop $HOSTNAME $HOSTPORT ./reqfile.txt || exit 1
++        exit 0
++        ;;
+     "resumption")
+         for req in $REQUESTS
+         do
