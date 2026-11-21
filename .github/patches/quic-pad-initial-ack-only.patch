@@ -1,0 +1,424 @@
+From 2ffe24729d5e8c73093580e4cdface83f8764063 Mon Sep 17 00:00:00 2001
+From: Liu Dongmiao <473522+liudongmiao@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 00:51:27 +0800
+Subject: [PATCH] quic: pad Initial ACK-only datagrams outside the packet
+
+When congestion limited, the TX packetiser uses the ACK_ONLY archetype,
+which cannot add PADDING frames. A datagram with an Initial packet must
+be at least 1200 bytes, so the datagram was abandoned after its ACK
+frames were generated, and the ACK of an Initial packet was not sent
+until the peer sent another ack-eliciting packet.
+
+Pad such a datagram with zero bytes outside any packet, which RFC 9000
+s. 14.1 allows and a receiver discards as an invalid packet. The ACK
+goes out at once, and the ACK-only packets stay out of bytes in flight,
+so the congestion window is respected (RFC 9002 s. 7). A 1-RTT packet
+must end its datagram, so its ACK is sent in the next datagram.
+
+A server pads only a datagram with an ack-eliciting Initial packet, as
+RFC 9000 s. 14.1 requires, so its ACK-only Initial packet is sent
+without padding.
+
+Add quic_txp_test scripts for an Initial ACK sent while congestion
+limited, alone, with a Handshake ACK and with a 1-RTT ACK, and for the
+padding of server datagrams.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ include/internal/quic_record_tx.h |   7 +
+ include/internal/quic_txp.h       |   1 +
+ ssl/quic/quic_channel.c           |   1 +
+ ssl/quic/quic_record_tx.c         |  12 ++
+ ssl/quic/quic_txp.c               |  41 ++++--
+ test/quic_txp_test.c              | 226 ++++++++++++++++++++++++++++++
+ 6 files changed, 278 insertions(+), 10 deletions(-)
+
+diff --git a/include/internal/quic_record_tx.h b/include/internal/quic_record_tx.h
+index d983d8bc79..8f2199761a 100644
+--- a/include/internal/quic_record_tx.h
++++ b/include/internal/quic_record_tx.h
+@@ -242,6 +242,13 @@ int ossl_qtx_write_pkt(OSSL_QTX *qtx, const OSSL_QTX_PKT *pkt);
+  */
+ void ossl_qtx_finish_dgram(OSSL_QTX *qtx);
+ 
++/*
++ * Pads the datagram being built to min_len bytes with zero bytes after its
++ * packets. A receiver discards them as an invalid packet. Does nothing if the
++ * datagram holds no packet or is already that long.
++ */
++void ossl_qtx_pad_dgram(OSSL_QTX *qtx, size_t min_len);
++
+ /*
+  * (Attempt to) flush any datagrams which are queued for transmission. Note that
+  * this does not cancel coalescing; call ossl_qtx_finish_dgram() first if that
+diff --git a/include/internal/quic_txp.h b/include/internal/quic_txp.h
+index ef1faff547..8e843cbf23 100644
+--- a/include/internal/quic_txp.h
++++ b/include/internal/quic_txp.h
+@@ -53,6 +53,7 @@ typedef struct ossl_quic_tx_packetiser_args_st {
+     QLOG *(*get_qlog_cb)(void *arg); /* Optional QLOG retrieval func */
+     void *get_qlog_cb_arg;
+     uint32_t protocol_version; /* The protocol version to try negotiating */
++    int is_server; /* Whether we are the server */
+ 
+     /*
+      * Injected dependencies - crypto streams.
+diff --git a/ssl/quic/quic_channel.c b/ssl/quic/quic_channel.c
+index b9388a3f3c..00beaa1bd1 100644
+--- a/ssl/quic/quic_channel.c
++++ b/ssl/quic/quic_channel.c
+@@ -252,6 +252,7 @@ static int ch_init(QUIC_CHANNEL *ch)
+     txp_args.get_qlog_cb = ch_get_qlog_cb;
+     txp_args.get_qlog_cb_arg = ch;
+     txp_args.protocol_version = QUIC_VERSION_1;
++    txp_args.is_server = ch->is_server;
+ 
+     for (pn_space = QUIC_PN_SPACE_INITIAL; pn_space < QUIC_PN_SPACE_NUM; ++pn_space) {
+         ch->crypto_send[pn_space] = ossl_quic_sstream_new(INIT_CRYPTO_SEND_BUF_LEN);
+diff --git a/ssl/quic/quic_record_tx.c b/ssl/quic/quic_record_tx.c
+index f5bd5b2f83..9d4f74d566 100644
+--- a/ssl/quic/quic_record_tx.c
++++ b/ssl/quic/quic_record_tx.c
+@@ -898,6 +898,18 @@ void ossl_qtx_finish_dgram(OSSL_QTX *qtx)
+     ++qtx->datagram_count;
+ }
+ 
++void ossl_qtx_pad_dgram(OSSL_QTX *qtx, size_t min_len)
++{
++    TXE *txe = qtx->cons;
++
++    if (txe == NULL || txe->data_len == 0 || txe->data_len >= min_len
++        || min_len > txe->alloc_len)
++        return;
++
++    memset(txe_data(txe) + txe->data_len, 0, min_len - txe->data_len);
++    txe->data_len = min_len;
++}
++
+ static void txe_to_msg(TXE *txe, BIO_MSG *msg)
+ {
+     msg->data = txe_data(txe);
+diff --git a/ssl/quic/quic_txp.c b/ssl/quic/quic_txp.c
+index 2bd713b289..2ef39dfe75 100644
+--- a/ssl/quic/quic_txp.c
++++ b/ssl/quic/quic_txp.c
+@@ -887,7 +887,7 @@ int ossl_quic_tx_packetiser_generate(OSSL_QUIC_TX_PACKETISER *txp,
+     struct txp_pkt pkt[QUIC_ENC_LEVEL_NUM];
+     size_t pkts_done = 0;
+     uint64_t cc_limit = txp->args.cc_method->get_tx_allowance(txp->args.cc_data);
+-    int need_padding = 0, txpim_pkt_reffed;
++    int need_padding = 0, pad_dgram = 0, txpim_pkt_reffed;
+ 
+     memset(status, 0, sizeof(*status));
+ 
+@@ -946,10 +946,13 @@ int ossl_quic_tx_packetiser_generate(OSSL_QUIC_TX_PACKETISER *txp,
+ 
+     /* 3. Packet Adjustment */
+     if (pkt[QUIC_ENC_LEVEL_INITIAL].h_valid
+-        && pkt[QUIC_ENC_LEVEL_INITIAL].h.bytes_appended > 0)
++        && pkt[QUIC_ENC_LEVEL_INITIAL].h.bytes_appended > 0
++        && (!txp->args.is_server
++            || pkt[QUIC_ENC_LEVEL_INITIAL].tpkt->ackm_pkt.is_ack_eliciting))
+         /*
+          * We have an Initial packet in this datagram, so we need to make sure
+-         * the total size of the datagram is adequate.
++         * the total size of the datagram is adequate. A server needs this only
++         * for an ack-eliciting Initial packet (RFC 9000 s. 14.1).
+          */
+         need_padding = 1;
+ 
+@@ -992,15 +995,30 @@ int ossl_quic_tx_packetiser_generate(OSSL_QUIC_TX_PACKETISER *txp,
+         }
+ 
+         /*
+-         * If we have failed to make a datagram of adequate size, for example
+-         * because we have a padding requirement but are using the ACK_ONLY
+-         * archetype (because we are CC limited), which precludes us from
+-         * sending padding, give up on generating the datagram - there is
+-         * nothing we can do.
++         * The ACK_ONLY archetype (because we are CC limited) cannot add
++         * PADDING frames, which would put the packets in flight. Pad the
++         * datagram outside any packet instead, which RFC 9000 s. 14.1 allows.
++         * Otherwise, if we have failed to make a datagram of adequate size,
++         * give up on generating it.
+          */
+         if (total_dgram_size < min_dpl) {
+-            res = 1;
+-            goto out;
++            if (archetype != TX_PACKETISER_ARCHETYPE_ACK_ONLY) {
++                res = 1;
++                goto out;
++            }
++
++            /*
++             * A 1-RTT packet must end the datagram, so it cannot come before
++             * the padding. Send its ACK in a later datagram.
++             */
++            if (pkt[QUIC_ENC_LEVEL_1RTT].h_valid
++                && pkt[QUIC_ENC_LEVEL_1RTT].h.bytes_appended > 0) {
++                if (pkt[QUIC_ENC_LEVEL_1RTT].tpkt->had_ack_frame)
++                    txp->want_ack |= 1UL << QUIC_PN_SPACE_APP;
++                txp_pkt_cleanup(&pkt[QUIC_ENC_LEVEL_1RTT], txp);
++            }
++
++            pad_dgram = 1;
+         }
+     }
+ 
+@@ -1058,6 +1076,9 @@ int ossl_quic_tx_packetiser_generate(OSSL_QUIC_TX_PACKETISER *txp,
+     /* Flush & Cleanup */
+     res = 1;
+ out:
++    if (pad_dgram)
++        ossl_qtx_pad_dgram(txp->args.qtx, QUIC_MIN_INITIAL_DGRAM_LEN);
++
+     ossl_qtx_finish_dgram(txp->args.qtx);
+ 
+     for (enc_level = QUIC_ENC_LEVEL_INITIAL;
+diff --git a/test/quic_txp_test.c b/test/quic_txp_test.c
+index 262a95683c..ce7a2d0a96 100644
+--- a/test/quic_txp_test.c
++++ b/test/quic_txp_test.c
+@@ -2081,6 +2081,231 @@ static int test_pto_script(int idx)
+     return run_script(idx, pto_scripts[idx]);
+ }
+ 
++/*
++ * While congestion limited, an Initial ACK is sent at once in a datagram
++ * padded outside its packet, so the packet itself stays ACK-only.
++ */
++static OSSL_CC_METHOD cc_blocked_method;
++
++static uint64_t cc_blocked_get_tx_allowance(OSSL_CC_DATA *cc)
++{
++    return 0;
++}
++
++/*
++ * Recreate the TXP with a congestion controller that allows nothing. Must run
++ * before any packet is sent, as the ACKM keeps callbacks into the TXP.
++ */
++static int recreate_txp_cc_blocked(struct helper *h, int validated)
++{
++    cc_blocked_method = ossl_cc_dummy_method;
++    cc_blocked_method.get_tx_allowance = cc_blocked_get_tx_allowance;
++    h->args.cc_method = &cc_blocked_method;
++
++    ossl_quic_tx_packetiser_free(h->txp);
++    if (!TEST_ptr(h->txp = ossl_quic_tx_packetiser_new(&h->args)))
++        return 0;
++
++    if (validated)
++        ossl_quic_tx_packetiser_set_validated(h->txp);
++    return 1;
++}
++
++static int cc_block(struct helper *h)
++{
++    return recreate_txp_cc_blocked(h, 1);
++}
++
++#ifdef OPK_NO_VALIDATION
++static int cc_block_unvalidated(struct helper *h)
++{
++    return recreate_txp_cc_blocked(h, 0);
++}
++#endif
++
++static int set_server(struct helper *h)
++{
++    h->args.is_server = 1;
++    return 1;
++}
++
++/* Recreate the TXP as a server. Must run before any packet is sent. */
++static int recreate_txp_as_server(struct helper *h)
++{
++    set_server(h);
++    ossl_quic_tx_packetiser_free(h->txp);
++    if (!TEST_ptr(h->txp = ossl_quic_tx_packetiser_new(&h->args)))
++        return 0;
++
++    ossl_quic_tx_packetiser_set_validated(h->txp);
++    return 1;
++}
++
++static int rx_ack_eliciting(struct helper *h, uint32_t pn_space, QUIC_PN pn)
++{
++    OSSL_ACKM_RX_PKT pkt = { 0 };
++
++    pkt.pkt_num = pn;
++    pkt.time = fake_now(NULL);
++    pkt.pkt_space = pn_space;
++    pkt.is_ack_eliciting = 1;
++    return TEST_true(ossl_ackm_on_rx_packet(h->args.ackm, &pkt));
++}
++
++static int rx_initial_ack_eliciting(struct helper *h)
++{
++    return rx_ack_eliciting(h, QUIC_PN_SPACE_INITIAL, 0);
++}
++
++static int rx_handshake_ack_eliciting(struct helper *h)
++{
++    return rx_ack_eliciting(h, QUIC_PN_SPACE_HANDSHAKE, 0);
++}
++
++static int rx_app_ack_eliciting(struct helper *h)
++{
++    return rx_ack_eliciting(h, QUIC_PN_SPACE_APP, 0);
++}
++
++static int check_1rtt_pkt(struct helper *h)
++{
++    return TEST_int_eq(h->qrx_pkt->hdr->type, QUIC_PKT_TYPE_1RTT);
++}
++
++/* The packet holds only its ACK frame, without PADDING frames */
++static int check_unpadded_initial(struct helper *h)
++{
++    return TEST_int_eq(h->qrx_pkt->hdr->type, QUIC_PKT_TYPE_INITIAL)
++        && TEST_size_t_lt(h->qrx_pkt->hdr->len, 100);
++}
++
++static int check_handshake_pkt(struct helper *h)
++{
++    return TEST_int_eq(h->qrx_pkt->hdr->type, QUIC_PKT_TYPE_HANDSHAKE);
++}
++
++static const struct script_op cc_ack_script_1[] = {
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_INITIAL, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_CHECK, 0, 0, NULL, 0, cc_block },
++    { OPK_CHECK, 0, 0, NULL, 0, rx_initial_ack_eliciting },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_EXPECT_DGRAM_LEN, 1200, 1200 },
++    { OPK_CHECK, 0, 0, NULL, 0, check_unpadded_initial },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_ACK_WITHOUT_ECN },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_RX_PKT_NONE },
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    { OPK_END }
++};
++
++/* A Handshake ACK due with the Initial ACK goes in the same datagram */
++static const struct script_op cc_ack_script_2[] = {
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_INITIAL, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_HANDSHAKE, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_CHECK, 0, 0, NULL, 0, cc_block },
++    { OPK_CHECK, 0, 0, NULL, 0, rx_initial_ack_eliciting },
++    { OPK_CHECK, 0, 0, NULL, 0, rx_handshake_ack_eliciting },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_EXPECT_DGRAM_LEN, 1200, 1200 },
++    { OPK_CHECK, 0, 0, NULL, 0, check_unpadded_initial },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_ACK_WITHOUT_ECN },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_RX_PKT },
++    { OPK_CHECK, 0, 0, NULL, 0, check_handshake_pkt },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_ACK_WITHOUT_ECN },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_RX_PKT_NONE },
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    { OPK_END }
++};
++
++/* A 1-RTT ACK, which must end a datagram, goes in the next datagram */
++static const struct script_op cc_ack_script_3[] = {
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_INITIAL, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_1RTT, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_CHECK, 0, 0, NULL, 0, cc_block },
++    { OPK_CHECK, 0, 0, NULL, 0, rx_initial_ack_eliciting },
++    { OPK_CHECK, 0, 0, NULL, 0, rx_app_ack_eliciting },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_EXPECT_DGRAM_LEN, 1200, 1200 },
++    { OPK_CHECK, 0, 0, NULL, 0, check_unpadded_initial },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_ACK_WITHOUT_ECN },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_RX_PKT_NONE },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_CHECK, 0, 0, NULL, 0, check_1rtt_pkt },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_ACK_WITHOUT_ECN },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_RX_PKT_NONE },
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    { OPK_END }
++};
++
++#ifdef OPK_NO_VALIDATION
++/* A server sends an ACK-only Initial packet without padding */
++static const struct script_op cc_ack_script_4[] = {
++    { OPK_NO_VALIDATION },
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_INITIAL, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_CHECK, 0, 0, NULL, 0, set_server },
++    { OPK_CHECK, 0, 0, NULL, 0, cc_block_unvalidated },
++    /* 3 * 100 = 300 covers the ACK but not a padded datagram */
++    { OPK_ADD_CREDIT, 100 },
++    { OPK_CHECK, 0, 0, NULL, 0, rx_initial_ack_eliciting },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_EXPECT_DGRAM_LEN, 1, 299 },
++    { OPK_CHECK, 0, 0, NULL, 0, check_unpadded_initial },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_ACK_WITHOUT_ECN },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_RX_PKT_NONE },
++    { OPK_END }
++};
++#endif
++
++/* A server still pads an ack-eliciting Initial packet */
++static const struct script_op cc_ack_script_5[] = {
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_INITIAL, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_CHECK, 0, 0, NULL, 0, recreate_txp_as_server },
++    { OPK_CRYPTO_SEND, QUIC_PN_SPACE_INITIAL, 0, pto_crypto_3,
++        sizeof(pto_crypto_3) },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_EXPECT_DGRAM_LEN, 1200, 1200 },
++    { OPK_END }
++};
++
++static const struct script_op *const cc_ack_scripts[] = {
++    cc_ack_script_1,
++    cc_ack_script_2,
++    cc_ack_script_3,
++#ifdef OPK_NO_VALIDATION
++    cc_ack_script_4,
++#endif
++    cc_ack_script_5,
++};
++
++static int test_cc_ack_script(int idx)
++{
++    return run_script(idx, cc_ack_scripts[idx]);
++}
++
+ /*
+  * Dynamic Script 1.
+  *
+@@ -2169,6 +2394,7 @@ int setup_tests(void)
+     fill_pto_crypto(pto_crypto_3, sizeof(pto_crypto_3));
+     fill_pto_crypto(pto_crypto_4, sizeof(pto_crypto_4));
+     ADD_ALL_TESTS(test_pto_script, OSSL_NELEM(pto_scripts));
++    ADD_ALL_TESTS(test_cc_ack_script, OSSL_NELEM(cc_ack_scripts));
+     ADD_ALL_TESTS(test_script, OSSL_NELEM(scripts));
+     ADD_ALL_TESTS(test_dyn_script_1,
+         (int)(OSSL_NELEM(dyn_script_1_crypto_1a)
+-- 
+2.54.0 (Apple Git-157)
+

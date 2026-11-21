@@ -1,0 +1,315 @@
+From 58914d5b011791a443986a4fa3c0fc93b159f2d6 Mon Sep 17 00:00:00 2001
+From: Liu Dongmiao <473522+liudongmiao@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 22:18:12 +0800
+Subject: [PATCH] quic: resend unacknowledged Handshake CRYPTO data in PTO
+ probes
+
+A Handshake PTO probe carried only PING, so a lost client Finished was
+not resent until an ACK showed it lost. Until then the server could not
+read 1-RTT packets and dropped them.
+
+Resend the first unacknowledged Handshake CRYPTO data in a PTO probe,
+as is done for Initial. A datagram with an Initial packet is padded, so
+a probe in it waits for anti-amplification credit for a full datagram.
+A Handshake probe on its own is kept within the credit.
+
+Add quic_txp_test scripts for Handshake probes, with and without enough
+anti-amplification credit.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ ssl/quic/quic_txp.c  |  68 ++++++++++++--------
+ test/quic_txp_test.c | 145 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 186 insertions(+), 27 deletions(-)
+
+diff --git a/ssl/quic/quic_txp.c b/ssl/quic/quic_txp.c
+index 2ef39dfe75..246ab1a881 100644
+--- a/ssl/quic/quic_txp.c
++++ b/ssl/quic/quic_txp.c
+@@ -69,8 +69,8 @@ struct ossl_quic_tx_packetiser_st {
+ 
+     size_t unvalidated_credit; /* Limit of data we can send until validated */
+ 
+-    /* Initial CRYPTO offset after the data sent in pending PTO probes. */
+-    uint64_t probe_crypto_next;
++    /* CRYPTO offset after the data sent in pending PTO probes, per PN space. */
++    uint64_t probe_crypto_next[QUIC_PN_SPACE_NUM];
+ 
+     /* Internal state - frame (re)generation flags. */
+     unsigned int want_handshake_done : 1;
+@@ -2175,31 +2175,43 @@ static int determine_stream_len(struct tx_helper *h,
+ }
+ 
+ /*
+- * Resend unacknowledged Initial CRYPTO data, such as the ClientHello, in a PTO
+- * probe rather than a bare PING (RFC 9002 s. 6.2.4). Each probe takes what fits
+- * after the data of the probe before it, and the rest stays in flight. On
+- * allocation failure the probe carries what was queued, or a PING.
++ * Resend unacknowledged Initial or Handshake CRYPTO data, such as the
++ * ClientHello or the Finished, in a PTO probe rather than a bare PING (RFC 9002
++ * s. 6.2.4). Each probe takes what fits after the data of the probe before it,
++ * and the rest stays in flight. On allocation failure the probe carries what
++ * was queued, or a PING.
+  */
+ static void txp_requeue_crypto_for_probe(OSSL_QUIC_TX_PACKETISER *txp,
+     struct txp_pkt *pkt)
+ {
+-    QUIC_SSTREAM *crypto = txp->args.crypto[QUIC_PN_SPACE_INITIAL];
++    uint32_t pn_space = ossl_quic_enc_level_to_pn_space(pkt->h.enc_level);
++    QUIC_SSTREAM *crypto = txp->args.crypto[pn_space];
+     OSSL_ACKM_PROBE_INFO *probe = ossl_ackm_get0_probe_request(txp->args.ackm);
+     OSSL_QUIC_FRAME_CRYPTO chdr = { 0 };
+-    uint64_t from = txp->probe_crypto_next, start, end, hdr_bytes;
++    uint64_t from = txp->probe_crypto_next[pn_space], start, end, hdr_bytes;
+     size_t space_left;
+ 
+-    if (pkt->h.enc_level != QUIC_ENC_LEVEL_INITIAL
+-        || probe->pto[QUIC_PN_SPACE_INITIAL] == 0)
++    if (pn_space == QUIC_PN_SPACE_APP || probe->pto[pn_space] == 0)
+         return;
+ 
+     /*
+-     * Data requeued here stays queued even if the probe is not sent, so wait
+-     * until the anti-amplification limit lets a full probe out.
++     * Data requeued here stays queued even if the probe is not sent. A
++     * datagram with an Initial packet is padded, so wait until the
++     * anti-amplification limit lets a full datagram out. Otherwise keep the
++     * whole probe, new data included, within the limit.
+      */
+-    if (!ossl_quic_tx_packetiser_check_unvalidated_credit(txp,
+-            pkt->h.max_ppl + pkt->geom.pkt_overhead))
+-        return;
++    if (pn_space == QUIC_PN_SPACE_INITIAL || pkt->geom.hwm > 0) {
++        if (!ossl_quic_tx_packetiser_check_unvalidated_credit(txp,
++                pkt->geom.hwm + pkt->h.max_ppl + pkt->geom.pkt_overhead))
++            return;
++    } else {
++        if (txp->unvalidated_credit
++            <= pkt->geom.pkt_overhead + pkt->h.bytes_appended)
++            return;
++
++        if (pkt->h.max_ppl > txp->unvalidated_credit - pkt->geom.pkt_overhead)
++            pkt->h.max_ppl = txp->unvalidated_credit - pkt->geom.pkt_overhead;
++    }
+ 
+     space_left = tx_helper_get_space_left_ack_eliciting(&pkt->h);
+     while (space_left >= MIN_FRAME_SIZE_CRYPTO
+@@ -2218,25 +2230,25 @@ static void txp_requeue_crypto_for_probe(OSSL_QUIC_TX_PACKETISER *txp,
+ }
+ 
+ /*
+- * After an Initial PTO probe is sent, start the next one after the CRYPTO data
+- * it carried. With nothing more to resend, a single probe is enough.
++ * After a PTO probe is sent, start the next one after the CRYPTO data it
++ * carried. With nothing more to resend, a single probe is enough.
+  */
+ static void txp_crypto_probe_sent(OSSL_QUIC_TX_PACKETISER *txp,
+-    QUIC_TXPIM_PKT *tpkt, OSSL_ACKM_PROBE_INFO *probe)
++    QUIC_TXPIM_PKT *tpkt, OSSL_ACKM_PROBE_INFO *probe, uint32_t pn_space)
+ {
+-    QUIC_SSTREAM *crypto = txp->args.crypto[QUIC_PN_SPACE_INITIAL];
++    QUIC_SSTREAM *crypto = txp->args.crypto[pn_space];
+     const QUIC_TXPIM_CHUNK *chunks = ossl_quic_txpim_pkt_get_chunks(tpkt);
+     size_t i, num_chunks = ossl_quic_txpim_pkt_get_num_chunks(tpkt);
+     uint64_t start, end;
+ 
+     for (i = 0; i < num_chunks; ++i)
+         if (chunks[i].stream_id == UINT64_MAX
+-            && chunks[i].end >= txp->probe_crypto_next)
+-            txp->probe_crypto_next = chunks[i].end + 1;
++            && chunks[i].end >= txp->probe_crypto_next[pn_space])
++            txp->probe_crypto_next[pn_space] = chunks[i].end + 1;
+ 
+-    if (!ossl_quic_sstream_get_first_unacked(crypto, txp->probe_crypto_next,
+-            &start, &end))
+-        probe->pto[QUIC_PN_SPACE_INITIAL] = 0;
++    if (!ossl_quic_sstream_get_first_unacked(crypto,
++            txp->probe_crypto_next[pn_space], &start, &end))
++        probe->pto[pn_space] = 0;
+ }
+ 
+ static int txp_generate_crypto_frames(OSSL_QUIC_TX_PACKETISER *txp,
+@@ -3277,12 +3289,14 @@ static int txp_pkt_commit(OSSL_QUIC_TX_PACKETISER *txp,
+         if (a.allow_force_ack_eliciting /* (i.e., not for 0-RTT) */
+             && probe_info->pto[pn_space] > 0) {
+             --probe_info->pto[pn_space];
+-            if (pn_space == QUIC_PN_SPACE_INITIAL)
+-                txp_crypto_probe_sent(txp, tpkt, probe_info);
++            if (pn_space != QUIC_PN_SPACE_APP)
++                txp_crypto_probe_sent(txp, tpkt, probe_info, pn_space);
+         }
+ 
+         if (probe_info->pto[QUIC_PN_SPACE_INITIAL] == 0)
+-            txp->probe_crypto_next = 0;
++            txp->probe_crypto_next[QUIC_PN_SPACE_INITIAL] = 0;
++        if (probe_info->pto[QUIC_PN_SPACE_HANDSHAKE] == 0)
++            txp->probe_crypto_next[QUIC_PN_SPACE_HANDSHAKE] = 0;
+     }
+ 
+     ossl_quic_fifd_pkt_discard_unreliable(&txp->fifd, tpkt);
+diff --git a/test/quic_txp_test.c b/test/quic_txp_test.c
+index ce7a2d0a96..1627424921 100644
+--- a/test/quic_txp_test.c
++++ b/test/quic_txp_test.c
+@@ -2063,6 +2063,144 @@ static const struct script_op pto_script_8[] = {
+ };
+ #endif
+ 
++/* Handshake PTO with CRYPTO data of one packet in flight */
++static const struct script_op pto_script_9[] = {
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_HANDSHAKE, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_CRYPTO_SEND, QUIC_PN_SPACE_HANDSHAKE, 0, pto_crypto_3,
++        sizeof(pto_crypto_3) },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_CHECK, 0, 0, NULL, 0, trigger_pto },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_first_probe },
++    { OPK_CHECK, 0, 0, NULL, 0, check_all_sent_3 },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    /* a second PTO resends the data from the start */
++    { OPK_CHECK, 0, 0, NULL, 0, trigger_pto },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_first_probe },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    { OPK_CHECK, 0, 0, NULL, 0, pto_flush_qtx },
++    { OPK_RX_PKT_NONE },
++    { OPK_END }
++};
++
++#ifdef OPK_NO_VALIDATION
++/* Handshake PTO with anti-amplification credit for less than a full datagram */
++static const struct script_op pto_script_10[] = {
++    { OPK_NO_VALIDATION },
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_HANDSHAKE, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    /* 3 * 100 = 300 covers the first packet and a probe of pto_crypto_3 */
++    { OPK_ADD_CREDIT, 100 },
++    { OPK_CRYPTO_SEND, QUIC_PN_SPACE_HANDSHAKE, 0, pto_crypto_3,
++        sizeof(pto_crypto_3) },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_CHECK, 0, 0, NULL, 0, trigger_pto },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_first_probe },
++    { OPK_CHECK, 0, 0, NULL, 0, check_all_sent_3 },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    { OPK_CHECK, 0, 0, NULL, 0, pto_flush_qtx },
++    { OPK_RX_PKT_NONE },
++    { OPK_END }
++};
++#endif
++
++#ifdef OPK_NO_VALIDATION
++/* With credit for part of the CRYPTO data, the probe carries what fits */
++static int check_part_probe(struct helper *h)
++{
++    return TEST_uint64_t_eq(h->frame.crypto.offset, 0)
++        && TEST_uint64_t_lt(h->frame.crypto.len, sizeof(pto_crypto_3))
++        && check_crypto_data(h);
++}
++
++static const struct script_op pto_script_11[] = {
++    { OPK_NO_VALIDATION },
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_HANDSHAKE, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_ADD_CREDIT, 60 },
++    { OPK_CRYPTO_SEND, QUIC_PN_SPACE_HANDSHAKE, 0, pto_crypto_3,
++        sizeof(pto_crypto_3) },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_CHECK, 0, 0, NULL, 0, trigger_pto },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_part_probe },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    { OPK_CHECK, 0, 0, NULL, 0, pto_flush_qtx },
++    { OPK_RX_PKT_NONE },
++    { OPK_END }
++};
++#endif
++
++#ifdef OPK_NO_VALIDATION
++/* New CRYPTO data queued with the resend does not push the probe over credit */
++static const unsigned char pto_crypto_next_byte[1] = { 64 };
++
++static const struct script_op pto_script_12[] = {
++    { OPK_NO_VALIDATION },
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_HANDSHAKE, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_ADD_CREDIT, 60 },
++    { OPK_CRYPTO_SEND, QUIC_PN_SPACE_HANDSHAKE, 0, pto_crypto_3,
++        sizeof(pto_crypto_3) },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_CRYPTO_SEND, QUIC_PN_SPACE_HANDSHAKE, 0, pto_crypto_next_byte,
++        sizeof(pto_crypto_next_byte) },
++    { OPK_CHECK, 0, 0, NULL, 0, trigger_pto },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_NEXT_FRAME },
++    { OPK_EXPECT_FRAME, OSSL_QUIC_FRAME_TYPE_CRYPTO },
++    { OPK_CHECK, 0, 0, NULL, 0, check_part_probe },
++    { OPK_EXPECT_NO_FRAME },
++    { OPK_END }
++};
++#endif
++
++#ifdef OPK_NO_VALIDATION
++/* With credit for less than the ACK already in the packet, nothing is sent */
++static int rx_handshake_ack_eliciting(struct helper *h);
++
++static const struct script_op pto_script_13[] = {
++    { OPK_NO_VALIDATION },
++    { OPK_PROVIDE_SECRET, QUIC_ENC_LEVEL_HANDSHAKE, QRL_SUITE_AES128GCM,
++        secret_1, sizeof(secret_1) },
++    { OPK_ADD_CREDIT, 48 },
++    { OPK_CRYPTO_SEND, QUIC_PN_SPACE_HANDSHAKE, 0, pto_crypto_3,
++        sizeof(pto_crypto_3) },
++    { OPK_TXP_GENERATE },
++    { OPK_RX_PKT },
++    { OPK_CHECK, 0, 0, NULL, 0, rx_handshake_ack_eliciting },
++    { OPK_CHECK, 0, 0, NULL, 0, trigger_pto },
++    { OPK_CHECK, 0, 0, NULL, 0, check_nothing_sent },
++    { OPK_CHECK, 0, 0, NULL, 0, pto_flush_qtx },
++    { OPK_RX_PKT_NONE },
++    { OPK_END }
++};
++#endif
++
+ static const struct script_op *const pto_scripts[] = {
+     pto_script_1,
+     pto_script_2,
+@@ -2073,6 +2211,13 @@ static const struct script_op *const pto_scripts[] = {
+ #ifdef OPK_NO_VALIDATION
+     pto_script_7,
+     pto_script_8,
++#endif
++    pto_script_9,
++#ifdef OPK_NO_VALIDATION
++    pto_script_10,
++    pto_script_11,
++    pto_script_12,
++    pto_script_13,
+ #endif
+ };
+ 
+-- 
+2.54.0 (Apple Git-157)
+
