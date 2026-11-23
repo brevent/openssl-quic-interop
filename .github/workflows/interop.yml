@@ -101,6 +101,7 @@ jobs:
                 '{client: $c, label: $c, image: $image, url: $url, digest: $digest}')
         }
         resolve_openssl() {
+            local branch commit
             [ "$1" = openssl-master ] && branch=master || branch=$1
             commit=$(git ls-remote https://github.com/openssl/openssl.git "$branch" | cut -f1)
             if [ -z "$commit" ]; then
@@ -131,7 +132,7 @@ jobs:
             echo "::error::no clients selected"
             exit 1
         fi
-        echo "builds=$(jq -c 'map(select(.commit)) | if . == [] then [{label: "none"}] else . end' <<< "$matrix")" >> "$GITHUB_OUTPUT"
+        builds=$(jq -c 'map(select(.commit))' <<< "$matrix")
         server_entry=$(jq -c --arg s "$SERVER" '.[] | select(.client == $s)' <<< "$matrix")
         if [ "${ROUNDS:-1}" -gt 1 ]; then
             matrix=$(jq -c --argjson n "$ROUNDS" '[.[] as $e | range(1; $n + 1) | $e + {label: "\($e.label)-\(.)", name: $e.label}]' <<< "$matrix")
@@ -150,8 +151,9 @@ jobs:
             label=nginx/nginx-quic-qns#17 SERVER=nginx
         elif [[ $SERVER == openssl-* ]]; then
             if [ -z "$server_entry" ]; then
-                echo "::error::server $SERVER needs client $SERVER"
-                exit 1
+                resolve_openssl "$SERVER"
+                server_entry=$entry
+                builds=$(jq -c --argjson e "$entry" '. + [$e]' <<< "$builds")
             fi
             label=$(jq -r .label <<< "$server_entry")
             url=$(jq -r .url <<< "$server_entry")
@@ -186,6 +188,7 @@ jobs:
             SERVER=nginx
         fi
         {
+            echo "builds=$(jq -c 'if . == [] then [{label: "none"}] else . end' <<< "$builds")"
             echo "server=$SERVER"
             echo "server_image=$image"
             echo "server_label=$label"
@@ -394,8 +397,10 @@ jobs:
     - name: Patch implementations file
       env:
         MATRIX: ${{ needs.resolve.outputs.matrix }}
+        SERVER: ${{ needs.resolve.outputs.server }}
       run: |
-        for name in $(jq -r '.[].client | select(startswith("openssl-"))' <<< "$MATRIX" | sort -u); do
+        for name in $({ jq -r '.[].client' <<< "$MATRIX"; echo "$SERVER"; } |
+            grep '^openssl-' | sort -u); do
             jq --arg n "$name" '. + {($n): {image: "\($n)-interop",
                   url: "https://github.com/openssl/openssl", role: "both"}}' \
                 implementations_quic.json > implementations.tmp
