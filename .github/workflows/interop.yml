@@ -103,7 +103,7 @@ jobs:
         resolve_openssl() {
             local branch commit
             [ "$1" = openssl-master ] && branch=master || branch=$1
-            commit=$(git ls-remote https://github.com/openssl/openssl.git "$branch" | cut -f1)
+            commit=$(git ls-remote https://github.com/openssl/openssl.git "refs/heads/$branch" | cut -f1)
             if [ -z "$commit" ]; then
                 echo "::error::no such branch in openssl/openssl: $branch"
                 exit 1
