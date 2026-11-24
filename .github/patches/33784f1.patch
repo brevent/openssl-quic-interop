@@ -1,0 +1,34 @@
+diff --git a/test/quic-openssl-docker/hq-interop/quic-hq-interop.c b/test/quic-openssl-docker/hq-interop/quic-hq-interop.c
+index f332ff129a43a..6200969cc23d9 100644
+--- a/test/quic-openssl-docker/hq-interop/quic-hq-interop.c
++++ b/test/quic-openssl-docker/hq-interop/quic-hq-interop.c
+@@ -936,6 +936,17 @@ int main(int argc, char *argv[])
+      * Now poll all our descriptors for events
+      */
+     while (this_poll_count != 0 && poll_done < this_poll_count) {
++        SSL_CONN_CLOSE_INFO cinfo;
++        int closed;
++
++        /*
++         * Polling the streams for SSL_POLL_EVENT_R does not report a closed
++         * connection, for example on an idle timeout. A closed connection
++         * receives no more data, so check before polling, and stop if no
++         * stream is readable.
++         */
++        closed = SSL_get_conn_close_info(ssl, &cinfo, sizeof(cinfo)) > 0;
++
+         result_count = 0;
+         poll_timeout.tv_sec = 0;
+         poll_timeout.tv_usec = 0;
+@@ -945,6 +956,11 @@ int main(int argc, char *argv[])
+             goto end;
+         }
+ 
++        if (closed && result_count == 0) {
++            fprintf(stderr, "Connection closed before all responses were received\n");
++            goto end;
++        }
++
+         /* Iterate over our poll array looking for ready SSL's */
+         for (poll_idx = 0; poll_idx < this_poll_count; poll_idx++) {
+             /*
