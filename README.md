@@ -15,9 +15,9 @@ The summary of each run shows a row of results per test, and each name links to 
 
 ## OpenSSL container
 
-Each run resolves the commits of both branches once and builds OpenSSL at those commits. For `openssl-3.5`, curl is pinned to 8.18.0, the last release with OpenSSL QUIC support.
+Each run resolves the commits of both branches once and builds OpenSSL at those commits.
 
-The container does not support some test cases, such as `multiconnect` (used by `handshakeloss` and `handshakecorruption`) and `keyupdate`, which report `unsupported`.
+For `openssl-3.5`, curl is pinned to 8.18.0, the last release with OpenSSL QUIC support. It takes two upstream patches to support `keyupdate` (U) and `multiconnect`, used by `handshakeloss` (L1) and `handshakecorruption` (C1).
 
 ## ngtcp2 and nginx images
 
