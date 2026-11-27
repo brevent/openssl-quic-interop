@@ -590,11 +590,14 @@ jobs:
         status=0
         git ls-remote --exit-code --heads "$url" results > /dev/null || status=$?
         case $status in
-        0) git clone -q --depth 1 --branch results "$url" results ;;
+        0) git clone -q --branch results "$url" results ;;
         2) git init -q -b results results ;;
         *) exit "$status" ;;
         esac
         cd results
+        git config user.name 'github-actions[bot]'
+        git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+        old=$(git rev-parse -q --verify HEAD) || old=
         week_ago=$(date -d '7 days ago' +%Y-%m-%d)
         for f in 20*.md; do
             if [ -e "$f" ] && [[ ${f:0:10} < $week_ago ]]; then
@@ -602,13 +605,27 @@ jobs:
             fi
         done
         cp ../summary.md "$(date +%Y-%m-%d)-$GITHUB_RUN_NUMBER.md"
-        {
-            echo "# OpenSSL QUIC interop results"
-            echo
-            ls 20*.md | sort -rV | sed 's|\(.*\)\.md$|- [\1](\1.md)|'
-        } > README.md
-        git add -A
-        git -c user.name='github-actions[bot]' \
-            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit -q -m "results of run $GITHUB_RUN_NUMBER"
-        git push -q "$url" HEAD:results
+        git checkout -q --orphan rebuild
+        git read-tree --empty
+        list=
+        for f in $(ls 20*.md | sort -V); do
+            list="$f $list"
+            {
+                echo "# OpenSSL QUIC interop results"
+                echo
+                for g in $list; do
+                    echo "- [${g%.md}]($g)"
+                done
+            } > README.md
+            when=$(git log -1 --format=%aI results -- "$f" 2>/dev/null) || when=
+            [ -n "$when" ] || when=$(date +%FT%T%z)
+            run=${f##*-}
+            git add "$f" README.md
+            GIT_AUTHOR_DATE=$when GIT_COMMITTER_DATE=$when \
+                git commit -q -m "results of run ${run%.md}"
+        done
+        set --
+        if [ -n "$old" ]; then
+            set -- --force-with-lease="results:$old"
+        fi
+        git push -q "$@" "$url" HEAD:results
